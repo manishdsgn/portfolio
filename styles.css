@@ -83,7 +83,10 @@ body {
   background: var(--bg);
   color: var(--ink);
   font-family: "Geist", "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif;
-  overflow-x: hidden;
+  /* `hidden` makes BODY a scroll container in WebKit, which prevents later
+     viewport-sticky card/footer stages from sticking. `clip` preserves the
+     horizontal crop without changing the sticky containing block. */
+  overflow-x: clip;
 }
 
 body.is-startup-loading {
@@ -1549,7 +1552,9 @@ body.capability-cards-active .capability-card__keyword::before {
   width: 100vw;
   min-height: 190svh;
   padding: 0;
-  overflow: clip;
+  /* BODY owns horizontal clipping. WebKit misplaces transformed descendants
+     when a sticky child sits inside an `overflow: clip` section. */
+  overflow: visible;
   background: var(--bg);
   color: var(--ink);
   pointer-events: auto;

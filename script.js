@@ -1075,6 +1075,66 @@ function measureAverageGlyphWidth(text, font) {
   return glyphMeasureContext.measureText(text).width / Math.max(1, text.length);
 }
 
+function clearOwlRasterCache(cache) {
+  cache.frames.length = 0;
+  cache.layoutCacheKey = "";
+  cache.currentIndex = -1;
+  cache.ready = false;
+}
+
+function cloneCanvasRaster(sourceCanvas) {
+  const raster = document.createElement("canvas");
+  raster.width = sourceCanvas.width;
+  raster.height = sourceCanvas.height;
+  const rasterCtx = raster.getContext("2d", { alpha: true });
+  rasterCtx?.drawImage(sourceCanvas, 0, 0);
+  return raster;
+}
+
+function drawCachedOwlRaster({
+  cache,
+  targetCanvas,
+  targetCtx,
+  renderState,
+  framePosition,
+  frameCount,
+}) {
+  if (
+    !IS_SAFARI_BROWSER ||
+    !cache.ready ||
+    cache.layoutCacheKey !== renderState.layoutCacheKey ||
+    cache.frames.length === 0 ||
+    targetCtx === null
+  ) {
+    return false;
+  }
+
+  const normalizedFrame = clamp(
+    framePosition / Math.max(1, frameCount - 1),
+    0,
+    1,
+  );
+  const rasterIndex = Math.round(
+    normalizedFrame * Math.max(0, cache.frames.length - 1),
+  );
+
+  if (cache.currentIndex !== rasterIndex || !renderState.rendered) {
+    targetCtx.save();
+    targetCtx.setTransform(1, 0, 0, 1, 0, 0);
+    targetCtx.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
+    targetCtx.drawImage(cache.frames[rasterIndex], 0, 0);
+    targetCtx.restore();
+    cache.currentIndex = rasterIndex;
+  }
+
+  renderState.currentFramePosition = framePosition;
+  renderState.currentFrameBucket = Math.round(
+    framePosition * INTRO_OWL_FRAME_BLEND_PRECISION,
+  );
+  renderState.rendered = true;
+  return true;
+}
+
 const GLYPH_FAMILIES = [
   "1I7",
   "LTV",
@@ -1201,8 +1261,13 @@ const WORK_OWL_SCENE_START_FRAME_RATIO = 0.28;
 const WORK_OWL_TARGET_FPS = 30;
 const SAFARI_INTRO_OWL_TARGET_FPS = 24;
 const SAFARI_CAMERA_TARGET_FPS = 30;
+const SAFARI_CAMERA_FAST_SCROLL_TARGET_FPS = 20;
 const SAFARI_WORK_OWL_ACTIVE_TARGET_FPS = 18;
 const SAFARI_WORK_OWL_SETTLED_TARGET_FPS = 24;
+// Disabled until a dense cropped atlas can preserve the source cadence. A
+// sparse full-canvas cache made the owl visibly step between frames.
+const SAFARI_INTRO_OWL_RASTER_FRAME_COUNT = 0;
+const SAFARI_WORK_OWL_RASTER_FRAME_COUNT = 0;
 const FOOTER_GLITCH_DOT_HOLD = 0.15;
 const FOOTER_GLITCH_STEP_TWO = 0.082;
 const FOOTER_GLITCH_STEP_THREE = 0.148;
@@ -1789,6 +1854,20 @@ const workOwlRenderState = {
   layoutCacheKey: "",
 };
 
+const safariIntroOwlRasterCache = {
+  frames: [],
+  layoutCacheKey: "",
+  currentIndex: -1,
+  ready: false,
+};
+
+const safariWorkOwlRasterCache = {
+  frames: [],
+  layoutCacheKey: "",
+  currentIndex: -1,
+  ready: false,
+};
+
 const introOwlAssemblyState = {
   active: false,
   complete: false,
@@ -1892,6 +1971,9 @@ let cameraCursorLastX = window.innerWidth * 0.5;
 let cameraCursorLastY = window.innerHeight * 0.5;
 let smoothScroller = null;
 let smoothScrollTickerCallback = null;
+let cameraRenderTick = null;
+let introOwlRenderTick = null;
+let workOwlRenderTick = null;
 let smoothScrollReconcileFrame = 0;
 let smoothScrollLockObserver = null;
 let lastObservedScrollLockState = null;
@@ -1902,7 +1984,7 @@ let lenisRecoveryAttempts = 0;
 let workScrollVelocity = 0;
 let workScrollFast = false;
 let workScrollSettleTimer = 0;
-let criticalSceneSyncFrame = 0;
+let criticalSceneSyncPending = true;
 let syncCapabilityCardsFromScroll = null;
 let syncFooterFromScroll = null;
 let cameraLastRenderTime = Number.NEGATIVE_INFINITY;
@@ -1945,7 +2027,7 @@ let workWaveScrollTriggers = [];
 let workWaveViewportWidth = 0;
 let workWaveViewportHeight = 0;
 let workWaveActiveIndex = -1;
-let workWaveCaptionFrame = 0;
+let workWaveCaptionPending = false;
 let workWaveCaptionDirection = 1;
 let workWaveCaptionVelocity = 0;
 let workWaveNameSlot = null;
@@ -3276,15 +3358,37 @@ function updateVisibleScrollTriggers(scrollState = null) {
 }
 
 function scheduleCriticalSceneSync() {
-  if (criticalSceneSyncFrame !== 0) return;
+  criticalSceneSyncPending = true;
+}
 
-  criticalSceneSyncFrame = window.requestAnimationFrame(() => {
-    criticalSceneSyncFrame = 0;
-    if (activePageId !== "work") return;
+function runWorkRenderScheduler(time, deltaTime) {
+  if (activePageId !== "work" || document.hidden) return;
 
+  // One authoritative frame transaction keeps ScrollTrigger-derived DOM
+  // state and Canvas 2D rasters on the same paint. WebKit is particularly
+  // sensitive to independent rAF/ticker callbacks racing each other.
+  if (criticalSceneSyncPending) {
+    criticalSceneSyncPending = false;
     syncCapabilityCardsFromScroll?.();
     syncFooterFromScroll?.();
-  });
+  }
+
+  if (workWaveCaptionPending) {
+    renderWorkWaveCaption();
+  }
+
+  cameraRenderTick?.(time, deltaTime);
+  introOwlRenderTick?.(time, deltaTime);
+  workOwlRenderTick?.(time, deltaTime);
+}
+
+function installRenderSchedulerTicker() {
+  if (smoothScrollTickerCallback !== null) {
+    gsap.ticker.remove(smoothScrollTickerCallback);
+  }
+
+  smoothScrollTickerCallback = runWorkRenderScheduler;
+  gsap.ticker.add(smoothScrollTickerCallback, false, true);
 }
 
 function suspendWorkRouteScene() {
@@ -4261,6 +4365,7 @@ function updateIntroOwlLayout() {
   ].join("|");
 
   if (introOwlState.layoutCacheKey !== layoutCacheKey) {
+    clearOwlRasterCache(safariIntroOwlRasterCache);
     introOwlState.glyphCellCache.clear();
     introOwlState.clipMaskCache.clear();
     introOwlState.currentFrameBucket = -1;
@@ -6424,6 +6529,7 @@ function clearIntroOwlCanvas() {
   introOwlCtx.setTransform(1, 0, 0, 1, 0, 0);
   introOwlCtx.clearRect(0, 0, introOwlCanvas.width, introOwlCanvas.height);
   introOwlCtx.restore();
+  safariIntroOwlRasterCache.currentIndex = -1;
 }
 
 function resetIntroOwlTemporalLayer() {
@@ -7449,6 +7555,7 @@ function activateNativeScrollFallback(reason = "runtime-recovery") {
   smoothScroller?.destroy?.();
   smoothScroller = null;
   scrollEngineMode = "native";
+  installRenderSchedulerTicker();
   gsap.ticker.lagSmoothing(500, 33);
   setupNativeScrollTracking();
   window.scrollTo(0, currentScrollY);
@@ -8696,7 +8803,15 @@ function renderFrame(framePosition) {
   ctx.clearRect(0, 0, state.canvasWidth, state.canvasHeight);
   ctx.fillStyle = CAMERA_CANVAS_BACKGROUND_COLOR;
   ctx.fillRect(0, 0, state.canvasWidth, state.canvasHeight);
-  drawTemporalCameraFrame();
+  const useTemporalBlend = !(IS_SAFARI_BROWSER && workScrollFast);
+  if (useTemporalBlend) {
+    drawTemporalCameraFrame();
+  } else {
+    // Two full-viewport canvas copies per scroll frame cost more than the
+    // subtle persistence effect on WebKit. Keep the scroll/compositor lane
+    // clear and resume temporal blending after velocity settles.
+    cameraTemporalReady = false;
+  }
 
   ctx.save();
   ctx.font = state.activeFont;
@@ -8718,7 +8833,9 @@ function renderFrame(framePosition) {
   }
 
   renderWhiteHole();
-  captureTemporalCameraFrame();
+  if (useTemporalBlend) {
+    captureTemporalCameraFrame();
+  }
 }
 
 function renderCurrentProgress() {
@@ -9064,7 +9181,7 @@ function setCameraTargetProgress(progress) {
 }
 
 function setupCameraRenderLoop() {
-  gsap.ticker.add((time, deltaTime) => {
+  cameraRenderTick = (time, deltaTime) => {
     if (
       cameraAssemblyState.active ||
       !state.cameraActive ||
@@ -9103,9 +9220,12 @@ function setupCameraRenderLoop() {
     const scrambleChanged =
       !workScrollFast &&
       Math.floor(time / SCRAMBLE_INTERVAL) !== state.currentScrambleBucket;
+    const safariTargetFps = workScrollFast
+      ? SAFARI_CAMERA_FAST_SCROLL_TARGET_FPS
+      : SAFARI_CAMERA_TARGET_FPS;
     const safariFrameReady =
       !IS_SAFARI_BROWSER ||
-      time - cameraLastRenderTime >= 1 / SAFARI_CAMERA_TARGET_FPS;
+      time - cameraLastRenderTime >= 1 / safariTargetFps;
 
     if (
       cameraPlaybackState.renderRequested ||
@@ -9135,7 +9255,7 @@ function setupCameraRenderLoop() {
         releaseCameraHandoff();
       }
     }
-  });
+  };
 }
 
 function getIntroOwlFrameIndex(loopProgress, frameCount) {
@@ -9187,7 +9307,7 @@ function getIntroOwlLoopDuration(frameCount) {
 function setupIntroOwlScramble() {
   if (!(introOwlCanvas instanceof HTMLCanvasElement)) return;
 
-  gsap.ticker.add((time) => {
+  introOwlRenderTick = (time) => {
     if (document.hidden || introOwlState.mask === null) return;
     if (
       introOwlAssemblyState.active ||
@@ -9201,8 +9321,6 @@ function setupIntroOwlScramble() {
     // Preserve the most recently rendered raster while WebKit handles a fast
     // scroll. The owl layer still moves on the compositor; only the expensive
     // thousands-of-glyph Canvas 2D repaint waits for scroll settle.
-    if (IS_SAFARI_BROWSER && workScrollFast) return;
-
     if (introOwlState.loopStartTime === null) {
       introOwlState.loopStartTime = time;
     }
@@ -9219,6 +9337,17 @@ function setupIntroOwlScramble() {
       ((time - introOwlState.loopStartTime) % loopDuration) /
       loopDuration;
     const framePosition = loopProgress * Math.max(0, frameCount - 1);
+    if (drawCachedOwlRaster({
+      cache: safariIntroOwlRasterCache,
+      targetCanvas: introOwlCanvas,
+      targetCtx: introOwlCtx,
+      renderState: introOwlState,
+      framePosition,
+      frameCount,
+    })) {
+      introOwlState.lastRenderTime = time;
+      return;
+    }
     const frameBucket = Math.round(
       framePosition * INTRO_OWL_FRAME_BLEND_PRECISION,
     );
@@ -9239,7 +9368,7 @@ function setupIntroOwlScramble() {
     introOwlState.scrambleBucket = scrambleBucket;
     introOwlState.currentScrambleBucket = scrambleBucket;
     renderIntroOwl(framePosition);
-  });
+  };
 }
 
 function setupSmoothScroll() {
@@ -9248,6 +9377,7 @@ function setupSmoothScroll() {
   if (FORCE_NATIVE_SCROLL) {
     scrollEngineMode = "native";
     setupNativeScrollTracking();
+    installRenderSchedulerTicker();
     gsap.ticker.lagSmoothing(500, 33);
     return;
   }
@@ -9274,8 +9404,9 @@ function setupSmoothScroll() {
   smoothScroller = lenis;
   scrollEngineMode = "lenis";
   lenis.on("scroll", updateVisibleScrollTriggers);
-  smoothScrollTickerCallback = (time) => {
+  smoothScrollTickerCallback = (time, deltaTime) => {
     lenis.raf(time * 1000);
+    runWorkRenderScheduler(time, deltaTime);
   };
   // Prioritize scroll interpolation before canvas and decorative callbacks so
   // ScrollTrigger reads the current Lenis position on the same frame.
@@ -11090,10 +11221,10 @@ function playFooterInteraction() {
     footerInteractionTimeline !== null &&
     !footerInteractionTimelinePrepared
   ) {
-    // A non-active, incomplete timeline is a previously interrupted opening.
-    // Never resume it midway: rebuild the opening from its authoritative
-    // initial frame so text, glyph burst, and owl cannot be skipped.
-    resetFooterInteraction();
+    // Once an entrance has started, interruption resolves forward. Rebuilding
+    // here made Safari replay the footer after a refresh or direction change.
+    setFooterInteractionFinal();
+    return;
   }
 
   // A fast wheel gesture can momentarily cross this trigger while the intro
@@ -11448,6 +11579,7 @@ function clearWorkOwlCanvas() {
   workOwlCtx.setTransform(1, 0, 0, 1, 0, 0);
   workOwlCtx.clearRect(0, 0, workOwlCanvas.width, workOwlCanvas.height);
   workOwlRenderState.temporalReady = false;
+  safariWorkOwlRasterCache.currentIndex = -1;
 }
 
 function updateWorkOwlCanvasSize() {
@@ -11552,6 +11684,7 @@ function updateWorkOwlCanvasSize() {
   ].join("|");
 
   if (workOwlRenderState.layoutCacheKey !== layoutCacheKey) {
+    clearOwlRasterCache(safariWorkOwlRasterCache);
     workOwlRenderState.glyphCellCache.clear();
     workOwlRenderState.clipMaskCache.clear();
     workOwlRenderState.temporalReady = false;
@@ -11934,10 +12067,94 @@ function renderWorkOwlFrame(framePosition = workOwlRenderState.currentFramePosit
   workOwlRenderState.rendered = true;
 }
 
+async function buildSafariOwlRasterCache({
+  cache,
+  frameTotal,
+  targetCanvas,
+  targetCtx,
+  renderState,
+  updateLayout,
+  renderFrame,
+}) {
+  if (
+    !IS_SAFARI_BROWSER ||
+    !isIntroOwlDataReady() ||
+    !(targetCanvas instanceof HTMLCanvasElement) ||
+    targetCtx === null
+  ) {
+    return;
+  }
+
+  updateLayout();
+  if (
+    targetCanvas.width === 0 ||
+    targetCanvas.height === 0 ||
+    renderState.layoutCacheKey === ""
+  ) {
+    return;
+  }
+
+  clearOwlRasterCache(cache);
+  const originalFramePosition = renderState.currentFramePosition;
+  const sourceFrameCount = getIntroOwlLoopFrameCount();
+  const rasterCount = Math.min(frameTotal, sourceFrameCount);
+  renderState.temporalReady = false;
+
+  for (let index = 0; index < rasterCount; index += 1) {
+    const framePosition = rasterCount <= 1
+      ? 0
+      : (index / (rasterCount - 1)) * (sourceFrameCount - 1);
+    renderState.scrambleTime = index * (SCRAMBLE_INTERVAL + 0.001);
+    renderFrame(framePosition);
+    cache.frames.push(cloneCanvasRaster(targetCanvas));
+
+    // WebKit performs the expensive Canvas 2D text upload here. Yielding one
+    // paint between snapshots keeps startup responsive and ensures the first
+    // user scroll only performs cheap drawImage calls.
+    await new Promise((resolve) => window.requestAnimationFrame(resolve));
+  }
+
+  cache.layoutCacheKey = renderState.layoutCacheKey;
+  cache.ready = cache.frames.length > 0;
+  cache.currentIndex = -1;
+  drawCachedOwlRaster({
+    cache,
+    targetCanvas,
+    targetCtx,
+    renderState,
+    framePosition: originalFramePosition,
+    frameCount: sourceFrameCount,
+  });
+}
+
+async function prewarmSafariOwlRasterCaches() {
+  if (!IS_SAFARI_BROWSER || !isIntroOwlDataReady()) return;
+
+  await buildSafariOwlRasterCache({
+    cache: safariIntroOwlRasterCache,
+    frameTotal: SAFARI_INTRO_OWL_RASTER_FRAME_COUNT,
+    targetCanvas: introOwlCanvas,
+    targetCtx: introOwlCtx,
+    renderState: introOwlState,
+    updateLayout: updateIntroOwlLayout,
+    renderFrame: renderIntroOwl,
+  });
+
+  await buildSafariOwlRasterCache({
+    cache: safariWorkOwlRasterCache,
+    frameTotal: SAFARI_WORK_OWL_RASTER_FRAME_COUNT,
+    targetCanvas: workOwlCanvas,
+    targetCtx: workOwlCtx,
+    renderState: workOwlRenderState,
+    updateLayout: updateWorkOwlCanvasSize,
+    renderFrame: renderWorkOwlFrame,
+  });
+}
+
 function setupWorkOwlRenderLoop() {
   if (!(workOwlCanvas instanceof HTMLCanvasElement)) return;
 
-  gsap.ticker.add((time) => {
+  workOwlRenderTick = (time) => {
     if (
       !workOwlSceneRendering ||
       document.hidden ||
@@ -11948,8 +12165,6 @@ function setupWorkOwlRenderLoop() {
 
     // Keep the last footer owl raster composited during a fast Safari scroll;
     // resume its internal frame animation as soon as scrolling settles.
-    if (IS_SAFARI_BROWSER && workScrollFast) return;
-
     const targetFps = IS_SAFARI_BROWSER
       ? footerInteractionState === "playing"
         ? SAFARI_WORK_OWL_ACTIVE_TARGET_FPS
@@ -11977,6 +12192,17 @@ function setupWorkOwlRenderLoop() {
       ((time - workOwlLoopStartTime) % loopDuration) /
       loopDuration;
     const framePosition = loopProgress * Math.max(0, frameCount - 1);
+    if (drawCachedOwlRaster({
+      cache: safariWorkOwlRasterCache,
+      targetCanvas: workOwlCanvas,
+      targetCtx: workOwlCtx,
+      renderState: workOwlRenderState,
+      framePosition,
+      frameCount,
+    })) {
+      workOwlLastRenderTime = time;
+      return;
+    }
     const frameBucket = Math.round(
       framePosition * INTRO_OWL_FRAME_BLEND_PRECISION,
     );
@@ -11996,7 +12222,7 @@ function setupWorkOwlRenderLoop() {
     workOwlRenderState.scrambleTime = time;
     workOwlRenderState.currentScrambleBucket = scrambleBucket;
     renderWorkOwlFrame(framePosition);
-  });
+  };
 }
 
 function applyWorkOwlSceneProgress(progress) {
@@ -12255,7 +12481,7 @@ function setupWorkOwlScene() {
 
     const bounds = workOwlScene.getBoundingClientRect();
     const hasReachedFooter =
-      bounds.top <= window.innerHeight * 0.9 && bounds.bottom > 0;
+      bounds.top <= window.innerHeight && bounds.bottom > 0;
     if (!hasReachedFooter) return;
 
     if (footerInteractionState === "complete") {
@@ -12275,7 +12501,7 @@ function setupWorkOwlScene() {
     trigger: workOwlScene,
     // Start as the sticky stage enters. The sequence remains time-based, but
     // it no longer waits until most of the first footer viewport has passed.
-    start: "top 86%",
+    start: "top bottom",
     end: "bottom bottom",
     invalidateOnRefresh: true,
     onEnter: reconcileFooterInteraction,
@@ -12288,7 +12514,12 @@ function setupWorkOwlScene() {
     },
     onLeaveBack() {
       if (document.body.dataset.currentPage !== "work") return;
-      resetFooterInteraction();
+      // The footer is a one-shot entrance for this page lifetime. If the user
+      // reverses direction during it, resolve to the authored final frame;
+      // never rewind into a blank footer that must be triggered again.
+      if (footerInteractionState === "playing") {
+        setFooterInteractionFinal();
+      }
       suspendWorkRouteScene();
     },
     onRefresh(self) {
@@ -12300,8 +12531,8 @@ function setupWorkOwlScene() {
       }
 
       if (self.progress <= 0) {
-        if (footerInteractionState !== "idle") {
-          resetFooterInteraction();
+        if (footerInteractionState === "playing") {
+          setFooterInteractionFinal();
         }
         suspendWorkRouteScene();
       }
@@ -12593,7 +12824,7 @@ function getWorkWaveCaptionTiming(index) {
 }
 
 function renderWorkWaveCaption() {
-  workWaveCaptionFrame = 0;
+  workWaveCaptionPending = false;
   if (!(workWaveCaption instanceof HTMLElement)) return;
   if (activePageId !== "work") {
     workWaveCaption.classList.remove("is-visible");
@@ -12637,8 +12868,7 @@ function renderWorkWaveCaption() {
 function scheduleWorkWaveCaption(direction, velocity) {
   workWaveCaptionDirection = direction || workWaveCaptionDirection;
   workWaveCaptionVelocity = velocity;
-  if (workWaveCaptionFrame !== 0) return;
-  workWaveCaptionFrame = window.requestAnimationFrame(renderWorkWaveCaption);
+  workWaveCaptionPending = true;
 }
 
 function setupWorkWaveGallery() {
@@ -15572,6 +15802,8 @@ async function prewarmDeferredCanvasEffects() {
     updateWorkOwlCanvasSize();
     renderWorkOwlFrame(getWorkOwlInitialFramePosition());
   }
+
+  await prewarmSafariOwlRasterCaches();
 }
 
 function settleWithTimeout(promise, timeoutMs) {
@@ -15987,7 +16219,7 @@ async function boot() {
     Promise.all([capabilityAssetsReady, galleryAssetsReady]),
     3200,
   );
-  await settleWithTimeout(canvasEffectsReady, 1600);
+  await settleWithTimeout(canvasEffectsReady, IS_SAFARI_BROWSER ? 5200 : 1600);
   prepareFooterInteractionTimeline();
   resetIntroTyperReveal();
   resetRouteScrollToTop();
