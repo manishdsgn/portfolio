@@ -1888,6 +1888,7 @@ let heroIntroTimeline = null;
 let heroTyperGroup = null;
 let heroIntroLastScrollY = window.scrollY;
 let heroScrollGateActive = false;
+let heroScrollGateFailsafeTimer = 0;
 let heroTextRevealComplete = false;
 let introTyperGroup = null;
 let introTyperHasPlayed = false;
@@ -1966,6 +1967,7 @@ let pageTransitionDpr = 1;
 let pageTransitionWidth = 0;
 let pageTransitionHeight = 0;
 let pageTransitionActive = false;
+let pageTransitionFailsafeTimer = 0;
 let routeTransitionSnapshot = null;
 let startupEntryTimeline = null;
 let startupEntryResolved = false;
@@ -2089,10 +2091,15 @@ function getShellRevealTargets() {
 }
 
 function releaseHeroScrollGate() {
-  if (!heroScrollGateActive) return;
+  const root = document.documentElement;
+  const wasLocked =
+    heroScrollGateActive || root.classList.contains("is-camera-intro-locked");
 
   heroScrollGateActive = false;
-  document.documentElement.classList.remove("is-camera-intro-locked");
+  window.clearTimeout(heroScrollGateFailsafeTimer);
+  heroScrollGateFailsafeTimer = 0;
+  root.classList.remove("is-camera-intro-locked");
+  if (!wasLocked) return;
   resetRouteScrollToTop();
 
   if (shouldResumeSmoothScroll()) {
@@ -2110,12 +2117,17 @@ function maybeReleaseHeroScrollGate() {
 }
 
 function beginHeroScrollGate() {
+  window.clearTimeout(heroScrollGateFailsafeTimer);
   heroScrollGateActive = true;
   heroTextRevealComplete = false;
   document.documentElement.classList.add("is-camera-intro-locked");
   resetRouteScrollToTop();
   smoothScroller?.stop?.();
-
+  // A text-animation callback must never be the only way to restore page
+  // input. WebKit may suspend timers/tickers during power or tab transitions.
+  heroScrollGateFailsafeTimer = window.setTimeout(() => {
+    releaseHeroScrollGate();
+  }, 5200);
 }
 
 function markHeroTextRevealComplete() {
@@ -2566,6 +2578,8 @@ function playStartupGlyphTransition(onRevealStart = null) {
     const finish = () => {
       if (hasFinished) return;
       hasFinished = true;
+      window.clearTimeout(pageTransitionFailsafeTimer);
+      pageTransitionFailsafeTimer = 0;
       pageTransitionTimeline = null;
       pageTransitionActive = false;
       document.documentElement.classList.remove("is-startup-transitioning");
@@ -2628,6 +2642,17 @@ function playStartupGlyphTransition(onRevealStart = null) {
         },
         ">",
       );
+
+    // Safari may pause a GSAP ticker while its tab or compositor changes
+    // state. A transient cover must never remain the document's scroll lock.
+    const startupTransition = pageTransitionTimeline;
+    pageTransitionFailsafeTimer = window.setTimeout(() => {
+      if (hasFinished || pageTransitionTimeline !== startupTransition) return;
+      startupTransition.kill();
+      hideStartupLoader();
+      finish();
+      startReveal();
+    }, 3200);
   });
 }
 
@@ -3132,6 +3157,8 @@ function captureCurrentRouteTransitionSnapshot() {
 }
 
 function finishPageTransition() {
+  window.clearTimeout(pageTransitionFailsafeTimer);
+  pageTransitionFailsafeTimer = 0;
   fadeOutPageTransitionNoise();
   pageTransitionTimeline = null;
   pageTransitionActive = false;
@@ -3553,6 +3580,9 @@ function setCurrentPage(targetId, shouldRefresh = true) {
   const isReturningToWork = targetId === "work" && previousPageId !== "work";
 
   if (targetId !== "work") {
+    // The camera intro belongs only to Work. Never carry its input lock into
+    // About or Playground if the user navigates before the typer completes.
+    releaseHeroScrollGate();
     stopCameraAmbientSwell();
     stopFooterAmbientOutro();
   }
@@ -3764,6 +3794,21 @@ function navigateToSection(targetId) {
       },
       "routeTransitionFade",
     );
+
+  const routeTransition = pageTransitionTimeline;
+  pageTransitionFailsafeTimer = window.setTimeout(() => {
+    if (!pageTransitionActive || pageTransitionTimeline !== routeTransition) return;
+
+    // Complete the requested navigation even when WebKit suspended the visual
+    // transition before its route-switch callback was reached.
+    closeCaseStudyForRouteSwitch();
+    if (activePageId !== targetId) {
+      setCurrentPage(targetId, true);
+      setActiveNavigation(targetId, false);
+    }
+    startRouteRevealDuringTransition();
+    routeTransition.kill();
+  }, 3200);
 }
 
 function clamp(value, min, max) {
@@ -9029,20 +9074,34 @@ function setupIntroOwlScramble() {
 function setupSmoothScroll() {
   ScrollTrigger.config({ ignoreMobileResize: true });
 
+  if (IS_SAFARI_BROWSER) {
+    // Native WebKit scrolling is already threaded. More importantly, keeping
+    // a stopped Lenis instance here applies `.lenis-stopped { overflow: clip }`
+    // and can freeze every route if any reveal callback is delayed. Safari
+    // uses native scroll as its sole authority; CSS classes own brief locks.
+    let previousScrollY = window.scrollY;
+    window.addEventListener("scroll", () => {
+      const nextScrollY = window.scrollY;
+      const velocity = nextScrollY - previousScrollY;
+      previousScrollY = nextScrollY;
+      updateVisibleScrollTriggers({ velocity });
+    }, { passive: true });
+
+    smoothScroller = null;
+    gsap.ticker.lagSmoothing(500, 33);
+    return;
+  }
+
   const lenis = new Lenis({
     autoRaf: true,
-    wheelMultiplier: IS_SAFARI_BROWSER ? 0.9 : 1,
+    wheelMultiplier: 1,
     touchMultiplier: 1,
     touchInertiaExponent: 1.7,
     syncTouchLerp: 0.075,
-    lerp: IS_SAFARI_BROWSER ? 0.16 : 0.18,
-    // Safari already provides threaded native wheel momentum. Re-smoothing it
-    // in JavaScript makes every visual trigger wait on the main thread, which
-    // is also responsible for the glyph canvases.
-    smoothWheel: !IS_SAFARI_BROWSER,
-    // Native WebKit touch momentum is already excellent and avoids a second
-    // main-thread scroll authority on iPhone/iPad Safari.
-    syncTouch: !IS_SAFARI_BROWSER,
+    lerp: 0.18,
+    smoothWheel: true,
+    // Lenis remains the single scroll owner on non-Safari touch browsers.
+    syncTouch: true,
   });
 
   smoothScroller = lenis;
@@ -15671,4 +15730,43 @@ async function boot() {
   syncWorkWaveGalleryToScroll();
 }
 
-boot();
+function recoverDocumentAfterInterruptedBoot(error = null) {
+  if (error) {
+    console.error("The animated startup was interrupted; restoring the document.", error);
+  }
+
+  window.clearTimeout(pageTransitionFailsafeTimer);
+  pageTransitionFailsafeTimer = 0;
+  pageTransitionTimeline?.kill();
+  pageTransitionTimeline = null;
+  pageTransitionActive = false;
+  document.documentElement.classList.remove(
+    "is-startup-transitioning",
+    "is-page-transitioning",
+  );
+  document.body.classList.remove("is-startup-loading");
+  pageTransitionRoot?.classList.remove("is-active", "is-covered");
+  pageTransitionRoot?.setAttribute("aria-hidden", "true");
+  if (pageTransitionRoot instanceof HTMLElement) {
+    gsap.set(pageTransitionRoot, { autoAlpha: 0 });
+  }
+  hideStartupLoader();
+  releaseHeroScrollGate();
+  cancelIntroRevealLock();
+  startupExperienceReady = true;
+
+  window.requestAnimationFrame(() => {
+    ScrollTrigger.refresh();
+    ScrollTrigger.update();
+  });
+}
+
+// Safari restores pages aggressively from its back/forward cache. If the page
+// was cached during a short animation lock, its timers do not necessarily
+// resume in the same order; restore the document to an interactive state.
+window.addEventListener("pageshow", (event) => {
+  if (!event.persisted) return;
+  recoverDocumentAfterInterruptedBoot();
+});
+
+boot().catch(recoverDocumentAfterInterruptedBoot);

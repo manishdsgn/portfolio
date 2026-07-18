@@ -263,6 +263,7 @@ html.is-case-study-transitioning body {
 
 html.is-page-transitioning,
 html.is-page-transitioning body {
+  overflow: hidden;
   overscroll-behavior: none;
 }
 
