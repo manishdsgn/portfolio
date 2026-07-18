@@ -8804,7 +8804,13 @@ function resize() {
 
   if (workOwlSceneActive && footerInteractionState === "complete") {
     setFooterInteractionFinal();
-  } else if (workOwlSceneActive) {
+  } else if (
+    workOwlSceneActive &&
+    footerInteractionState !== "playing"
+  ) {
+    // The footer timeline is the sole transform/visibility owner while the
+    // owl is entering. Re-applying the legacy progress state here would reset
+    // its opacity to zero during a resize or Safari viewport update.
     applyWorkOwlSceneProgress(workOwlSceneProgress);
   }
 
@@ -11957,7 +11963,12 @@ function setWorkOwlSceneActive(isActive, shouldRender = isActive) {
       workOwlSceneProgress = 1;
     }
     renderWorkOwlInitialFrameIfNeeded();
-    applyWorkOwlSceneProgress(workOwlSceneProgress);
+    // ScrollTrigger calls this method repeatedly while scrolling. During the
+    // authored entrance those calls may resume the canvas renderer, but they
+    // must not overwrite the timeline's transform or visibility state.
+    if (footerInteractionState !== "playing") {
+      applyWorkOwlSceneProgress(workOwlSceneProgress);
+    }
     return;
   }
 
@@ -12034,10 +12045,10 @@ function setupWorkOwlScene() {
 
   workOwlScenePresenceScrollTrigger = ScrollTrigger.create({
     trigger: workOwlScene,
-    // Begin as the sticky footer enters the viewport. The first half of the
-    // sequence can pre-roll while the stage rises into view, so even a fast
-    // Safari scroll does not arrive at an intentionally empty opening frame.
-    start: "top bottom",
+    // Begin only once the sticky stage's centre is actually in view. Starting
+    // at `top bottom` made the owl complete its entrance below the viewport,
+    // so users saw only the settled frame when they reached the footer.
+    start: "top 20%",
     end: "bottom bottom",
     invalidateOnRefresh: true,
     onEnter: reconcileFooterInteraction,
@@ -15193,7 +15204,9 @@ function refreshIntroOwlDataDependents() {
         ? workOwlRenderState.currentFramePosition
         : getWorkOwlInitialFramePosition(),
     );
-    applyWorkOwlSceneProgress(workOwlSceneProgress);
+    if (footerInteractionState !== "playing") {
+      applyWorkOwlSceneProgress(workOwlSceneProgress);
+    }
   }
 
   // Loading the canvas data does not change document geometry. Refreshing all
