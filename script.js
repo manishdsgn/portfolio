@@ -21,6 +21,13 @@ import { CustomEase } from "gsap/CustomEase";
 import { SplitText } from "gsap/SplitText";
 
 gsap.registerPlugin(ScrollTrigger, CustomEase, SplitText);
+if ("scrollRestoration" in window.history) {
+  window.history.scrollRestoration = "manual";
+}
+const IS_SAFARI_BROWSER =
+  navigator.vendor === "Apple Computer, Inc." &&
+  /Safari/.test(navigator.userAgent) &&
+  !/(CriOS|FxiOS|EdgiOS|OPiOS)/.test(navigator.userAgent);
 const playGlyphSplashSound = defineSound(tomGlyphRhythm);
 const playFooterOrganGlyphSound = defineSound(footerOrganGlyphRhythm);
 const playMinimalPopSound = defineSound(minimalPop);
@@ -83,13 +90,14 @@ const CAPABILITY_HIGHLIGHT_INITIAL_TAP_VOLUME = 0.62;
 const CAPABILITY_HIGHLIGHT_TAP_CARD_OFFSET = 0.045;
 const PAGE_TRANSITION_NOISE_VOLUME = 0.16;
 const PAGE_TRANSITION_NOISE_FADE_OUT_DURATION = 0.48;
+const PROJECT_AUDIO_MASTER_VOLUME = 0.58;
 const INTRO_KEY_PRESS_MIN_INTERVAL_MS = 28;
 const INTRO_KEY_PRESS_DETUNE_PATTERN = Object.freeze([-45, 0, 35, 0]);
 const CAMERA_AMBIENT_SOUND_PATH = "/audio/hero-ambient-swell.mp3";
-const CAMERA_AMBIENT_RISE_VOLUME = 0.13;
-const CAMERA_AMBIENT_PEAK_VOLUME = 0.32;
+const CAMERA_AMBIENT_RISE_VOLUME = 0.09;
+const CAMERA_AMBIENT_PEAK_VOLUME = 0.2;
 const FOOTER_AMBIENT_START_TIME = 0.55;
-const FOOTER_AMBIENT_VOLUME = 0.28;
+const FOOTER_AMBIENT_VOLUME = 0.18;
 const FOOTER_AMBIENT_DURATION = 2.28;
 const FOOTER_AMBIENT_FADE_OUT_DURATION = 0.86;
 const cameraAmbientAudio = new Audio(CAMERA_AMBIENT_SOUND_PATH);
@@ -872,7 +880,6 @@ const INTRO_OWL_BLUE_MID = { r: 25, g: 67, b: 245 };
 const INTRO_OWL_BLUE_DARK = { r: 4, g: 25, b: 150 };
 const INTRO_OWL_EXIT_X_OVERFLOW_RATIO = 0.3;
 const INTRO_OWL_EXIT_Y_VH = 58;
-const INTRO_OWL_EXIT_SCRUB_SECONDS = 0.8;
 const INTRO_OWL_CURSOR_LABEL_TEXT = "owl of wisdom";
 const CAMERA_CURSOR_LABEL_TEXT = "scroll through my lens";
 const CAMERA_CURSOR_HERO_PROGRESS_MAX = 0.003;
@@ -884,6 +891,9 @@ const WORK_OWL_SCENE_ENTER_DURATION = 0.9;
 const WORK_OWL_SCENE_START_MARGIN_RATIO = 0.62;
 const WORK_OWL_SCENE_START_FRAME_RATIO = 0.28;
 const WORK_OWL_TARGET_FPS = 30;
+const SAFARI_INTRO_OWL_TARGET_FPS = 24;
+const SAFARI_WORK_OWL_ACTIVE_TARGET_FPS = 18;
+const SAFARI_WORK_OWL_SETTLED_TARGET_FPS = 24;
 const FOOTER_GLITCH_DOT_HOLD = 0.15;
 const FOOTER_GLITCH_STEP_TWO = 0.082;
 const FOOTER_GLITCH_STEP_THREE = 0.148;
@@ -1280,6 +1290,9 @@ const capabilityGlyphBurstState = createGlyphBurstState(capabilityGlyphBurstCanv
 const capabilityCards = Array.from(
   document.querySelectorAll("[data-capability-card]"),
 );
+const capabilityCardImages = capabilityCards.flatMap((card) =>
+  Array.from(card.querySelectorAll("img")),
+);
 const capabilityCardInners = Array.from(
   document.querySelectorAll("[data-capability-card-inner]"),
 );
@@ -1547,7 +1560,8 @@ const cameraPlaybackState = {
 let introRevealTimeline = null;
 let introRevealScrollTrigger = null;
 let introOwlDataPromise = null;
-let introOwlWarmupScheduled = false;
+let deferredVisualWarmupScheduled = false;
+let capabilityCardAssetWarmupPromise = null;
 let introOwlAssemblyPending = false;
 let introOwlAssemblyTimeline = null;
 let introOwlExitTimeline = null;
@@ -1660,6 +1674,7 @@ let pageTransitionActive = false;
 let routeTransitionSnapshot = null;
 let startupEntryTimeline = null;
 let startupEntryResolved = false;
+let startupExperienceReady = false;
 let resolveStartupEntryChoice = null;
 const startupEntryChoice = new Promise((resolve) => {
   resolveStartupEntryChoice = resolve;
@@ -2152,7 +2167,9 @@ function chooseStartupEntry(soundEnabled, event) {
 
   if (soundEnabled) {
     try {
-      setWebKitsMasterVolume(1);
+      // Unity gain made Safari's unlocked Web Audio voices and the separately
+      // mixed ambient tracks feel much louder than the visual interactions.
+      setWebKitsMasterVolume(PROJECT_AUDIO_MASTER_VOLUME);
     } catch {
       // The site can still enter if Web Audio is unavailable.
     }
@@ -8619,7 +8636,10 @@ function setupIntroOwlScramble() {
       introOwlState.loopStartTime = time;
     }
 
-    const minimumFrameInterval = 1 / INTRO_OWL_TARGET_FPS;
+    const targetFps = IS_SAFARI_BROWSER
+      ? SAFARI_INTRO_OWL_TARGET_FPS
+      : INTRO_OWL_TARGET_FPS;
+    const minimumFrameInterval = 1 / targetFps;
     if (time - introOwlState.lastRenderTime < minimumFrameInterval) return;
 
     const frameCount = getIntroOwlLoopFrameCount();
@@ -9487,7 +9507,10 @@ function setupIntroOwlExit() {
     trigger: introSection,
     start: "bottom bottom",
     end: "bottom top",
-    scrub: INTRO_OWL_EXIT_SCRUB_SECONDS,
+    // The sticky text releases at this same scroll boundary. A numeric scrub
+    // deliberately trails the scrollbar and made Safari move the text first,
+    // then let the owl catch up. Direct binding keeps both departures locked.
+    scrub: true,
     animation: introOwlExitTimeline,
     invalidateOnRefresh: true,
     onScrubComplete(self) {
@@ -9890,20 +9913,6 @@ function prepareFooterGlyphBurst() {
   return buildGlyphBurst(footerGlyphBurstState, origin);
 }
 
-function scheduleFooterGlyphBurstPrewarm() {
-  const prewarm = () => {
-    prepareFooterGlyphBurst();
-    clearGlyphBurst(footerGlyphBurstState);
-  };
-
-  if ("requestIdleCallback" in window) {
-    window.requestIdleCallback(prewarm, { timeout: 1200 });
-    return;
-  }
-
-  window.setTimeout(prewarm, 0);
-}
-
 function playFooterGlyphBurst() {
   const origin = getFooterGlyphBurstOrigin();
   if (origin === null) return;
@@ -10164,6 +10173,7 @@ function isFooterInteractionStartBlocked() {
   const root = document.documentElement;
 
   return (
+    !startupExperienceReady ||
     introRevealLockActive ||
     pageTransitionActive ||
     root.classList.contains("is-intro-reveal-locked") ||
@@ -11248,7 +11258,12 @@ function setupWorkOwlRenderLoop() {
       return;
     }
 
-    const minimumFrameInterval = 1 / WORK_OWL_TARGET_FPS;
+    const targetFps = IS_SAFARI_BROWSER
+      ? footerInteractionState === "playing"
+        ? SAFARI_WORK_OWL_ACTIVE_TARGET_FPS
+        : SAFARI_WORK_OWL_SETTLED_TARGET_FPS
+      : WORK_OWL_TARGET_FPS;
+    const minimumFrameInterval = 1 / targetFps;
     if (time - workOwlLastRenderTime < minimumFrameInterval) return;
 
     const frameCount = getIntroOwlLoopFrameCount();
@@ -11533,7 +11548,6 @@ function setupWorkOwlScene() {
   workOwlRenderState.currentScrambleBucket = -1;
 
   resetFooterInteraction();
-  scheduleFooterGlyphBurstPrewarm();
 
   workOwlScenePresenceScrollTrigger = ScrollTrigger.create({
     trigger: workOwlScene,
@@ -14509,25 +14523,90 @@ function refreshIntroOwlDataDependents() {
     applyWorkOwlSceneProgress(workOwlSceneProgress);
   }
 
-  ScrollTrigger.refresh();
+  // Loading the canvas data does not change document geometry. Refreshing all
+  // triggers here could interrupt a first Safari scroll while the data was
+  // finishing in the background.
+  ScrollTrigger.update();
 }
 
-function scheduleIntroOwlDataWarmup() {
-  if (introOwlWarmupScheduled || isIntroOwlDataReady()) return;
+function waitForCapabilityCardImage(image) {
+  if (image.complete) return Promise.resolve();
 
-  introOwlWarmupScheduled = true;
+  return new Promise((resolve) => {
+    image.addEventListener("load", resolve, { once: true });
+    image.addEventListener("error", resolve, { once: true });
+  });
+}
+
+function warmCapabilityCardAssets() {
+  if (capabilityCardAssetWarmupPromise !== null) {
+    return capabilityCardAssetWarmupPromise;
+  }
+
+  capabilityCardAssetWarmupPromise = (async () => {
+    capabilityCardImages.forEach((image) => {
+      image.loading = "eager";
+      image.setAttribute("fetchpriority", "low");
+    });
+
+    await Promise.all(capabilityCardImages.map(waitForCapabilityCardImage));
+
+    // Decode one image per frame so Safari never has to decode every 3D card
+    // face synchronously when the sticky deck first enters the viewport.
+    for (const image of capabilityCardImages) {
+      if (typeof image.decode === "function" && image.naturalWidth > 0) {
+        await image.decode().catch(() => {});
+      }
+      await new Promise((resolve) => window.requestAnimationFrame(resolve));
+    }
+  })();
+
+  return capabilityCardAssetWarmupPromise;
+}
+
+function prewarmDeferredCanvasEffects() {
+  capabilityGlyphBurstState.maxDpr = CAPABILITY_GLYPH_BURST_MAX_DPR;
+  buildGlyphBurst(capabilityGlyphBurstState);
+  clearGlyphBurst(capabilityGlyphBurstState);
+
+  prepareFooterGlyphBurst();
+  clearGlyphBurst(footerGlyphBurstState);
+
+  if (isIntroOwlDataReady() && !workOwlRenderState.rendered) {
+    updateWorkOwlCanvasSize();
+    renderWorkOwlFrame(getWorkOwlInitialFramePosition());
+  }
+}
+
+function scheduleDeferredVisualWarmup() {
+  if (deferredVisualWarmupScheduled) return;
+
+  deferredVisualWarmupScheduled = true;
   const warmup = () => {
-    loadIntroOwlData().catch((error) => {
-      console.error("Unable to warm intro owl data.", error);
+    // Keep these queues independent: a slow card image must never postpone
+    // the footer owl's first decoded/rendered frame.
+    loadIntroOwlData()
+      .then(() => new Promise((resolve) => window.requestAnimationFrame(resolve)))
+      .then(() => {
+        if (activePageId === "work") {
+          prewarmDeferredCanvasEffects();
+        }
+      })
+      .catch((error) => {
+        console.error("Unable to warm the deferred owl visuals.", error);
+      });
+
+    warmCapabilityCardAssets().catch((error) => {
+      console.error("Unable to warm the capability card assets.", error);
     });
   };
 
   if ("requestIdleCallback" in window) {
-    window.requestIdleCallback(warmup, { timeout: 1400 });
+    window.requestIdleCallback(warmup, { timeout: 2400 });
     return;
   }
 
-  window.setTimeout(warmup, 450);
+  window.setTimeout(warmup, 700);
 }
 
 function settleWithTimeout(promise, timeoutMs) {
@@ -14823,19 +14902,53 @@ async function loadWorkFooterSceneData() {
 }
 
 let viewportResizeFrame = 0;
+let viewportResizeTimer = 0;
+let lastWindowViewportWidth = window.innerWidth;
+let lastVisualViewportWidth = window.visualViewport?.width ?? window.innerWidth;
 
 function scheduleViewportResize() {
-  if (viewportResizeFrame !== 0) return;
+  window.clearTimeout(viewportResizeTimer);
+  viewportResizeTimer = window.setTimeout(() => {
+    viewportResizeTimer = 0;
+    if (viewportResizeFrame !== 0) return;
 
-  viewportResizeFrame = window.requestAnimationFrame(() => {
-    viewportResizeFrame = 0;
-    resize();
+    viewportResizeFrame = window.requestAnimationFrame(() => {
+      viewportResizeFrame = 0;
+      resize();
 
-    if (activePageId === "work") {
-      ScrollTrigger.refresh();
-      syncWorkWaveGalleryToScroll();
-    }
-  });
+      if (activePageId === "work") {
+        ScrollTrigger.refresh();
+        syncWorkWaveGalleryToScroll();
+      }
+    });
+  }, 120);
+}
+
+function handleWindowResize() {
+  const nextWidth = window.innerWidth;
+  const widthChanged = Math.abs(nextWidth - lastWindowViewportWidth) >= 1;
+  lastWindowViewportWidth = nextWidth;
+
+  // Safari's collapsing browser chrome can emit height-only resize events on
+  // touch devices while scrolling. Those events do not alter this layout and
+  // must not refresh every ScrollTrigger in the middle of a scene.
+  if (
+    IS_SAFARI_BROWSER &&
+    window.matchMedia("(pointer: coarse)").matches &&
+    !widthChanged
+  ) {
+    return;
+  }
+
+  scheduleViewportResize();
+}
+
+function handleVisualViewportResize() {
+  const nextWidth = window.visualViewport?.width ?? window.innerWidth;
+  if (Math.abs(nextWidth - lastVisualViewportWidth) < 1) return;
+
+  lastVisualViewportWidth = nextWidth;
+  scheduleViewportResize();
 }
 
 async function boot() {
@@ -14868,8 +14981,8 @@ async function boot() {
   setupIntroOwlScramble();
   setupWorkOwlRenderLoop();
 
-  window.addEventListener("resize", scheduleViewportResize, { passive: true });
-  window.visualViewport?.addEventListener("resize", scheduleViewportResize, {
+  window.addEventListener("resize", handleWindowResize, { passive: true });
+  window.visualViewport?.addEventListener("resize", handleVisualViewportResize, {
     passive: true,
   });
 
@@ -14878,7 +14991,6 @@ async function boot() {
   resetRouteScrollToTop();
   ScrollTrigger.update();
   await startupEntryChoice;
-  scheduleIntroOwlDataWarmup();
   resetIntroTyperReveal();
   resetRouteScrollToTop();
   ScrollTrigger.update();
@@ -14888,6 +15000,10 @@ async function boot() {
     playCameraAssemblyIntro();
     window.setTimeout(playHeroIntro, 180);
   });
+  resetRouteScrollToTop();
+  startupExperienceReady = true;
+  ScrollTrigger.update();
+  scheduleDeferredVisualWarmup();
 }
 
 boot();
