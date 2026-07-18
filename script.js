@@ -7,6 +7,7 @@ import {
   defineSound,
   ensureReady as ensureWebKitsAudioReady,
   getDestination as getWebKitsAudioDestination,
+  getMasterBus as getWebKitsAudioMasterBus,
   setMasterVolume as setWebKitsMasterVolume,
 } from "@web-kits/audio";
 import { pop as minimalPop, tap as minimalTap } from "./.web-kits/minimal.ts";
@@ -88,6 +89,9 @@ const CAPABILITY_HIGHLIGHT_TAP_CARD_OFFSET = 0.045;
 const PAGE_TRANSITION_NOISE_VOLUME = 0.16;
 const PAGE_TRANSITION_NOISE_FADE_OUT_DURATION = 0.48;
 const PROJECT_AUDIO_MASTER_VOLUME = 0.58;
+const PROJECT_AUDIO_UNLOCK_TIMEOUT_MS = 1400;
+const GALLERY_POP_MIN_INTERVAL_MS = 110;
+const CAPABILITY_TAP_MIN_INTERVAL_MS = 90;
 const INTRO_KEY_PRESS_MIN_INTERVAL_MS = 28;
 const INTRO_KEY_PRESS_DETUNE_PATTERN = Object.freeze([-45, 0, 35, 0]);
 const CAMERA_AMBIENT_SOUND_PATH = "/audio/hero-ambient-swell.mp3";
@@ -109,6 +113,14 @@ footerAmbientAudio.preservesPitch = false;
 let projectSoundEnabled = false;
 let webKitsAudioReady = false;
 let webKitsAudioUnlockPromise = null;
+let projectAudioContext = null;
+let projectAudioLimiter = null;
+let cameraAmbientSource = null;
+let footerAmbientSource = null;
+let cameraAmbientGain = null;
+let footerAmbientGain = null;
+let cameraAmbientAttempt = 0;
+let footerAmbientAttempt = 0;
 let pendingClickStatePop = false;
 let pendingGlyphSplash = false;
 let glyphSplashSampleReady = false;
@@ -129,6 +141,119 @@ let introHighlightSwooshPlayedWords = new WeakSet();
 const introHighlightSwooshQueue = [];
 const introHighlightSwooshVoices = [];
 let pageTransitionNoiseVoice = null;
+let galleryPopLastPlayedAt = Number.NEGATIVE_INFINITY;
+let capabilityTapLastPlayedAt = Number.NEGATIVE_INFINITY;
+
+function safeSetMediaTime(media, time) {
+  try {
+    media.currentTime = time;
+  } catch {
+    // Safari can reject a seek until metadata exists; the next play attempt
+    // will retry from the requested cue point.
+  }
+}
+
+function configureProjectAudioGraph() {
+  const masterBus = getWebKitsAudioMasterBus();
+  const context = masterBus.context;
+
+  if (projectAudioContext !== context || projectAudioLimiter === null) {
+    projectAudioContext = context;
+    projectAudioLimiter = context.createDynamicsCompressor();
+    projectAudioLimiter.threshold.value = -12;
+    projectAudioLimiter.knee.value = 6;
+    projectAudioLimiter.ratio.value = 14;
+    projectAudioLimiter.attack.value = 0.003;
+    projectAudioLimiter.release.value = 0.14;
+
+    try {
+      masterBus.disconnect();
+    } catch {
+      // A newly-created bus may not have an active connection yet.
+    }
+    masterBus.connect(projectAudioLimiter);
+    projectAudioLimiter.connect(context.destination);
+
+    context.addEventListener("statechange", () => {
+      webKitsAudioReady = context.state === "running";
+    });
+  }
+
+  setWebKitsMasterVolume(PROJECT_AUDIO_MASTER_VOLUME);
+
+  // Route HTML media through the same master/limiter as generated effects.
+  // This keeps Safari from switching between two unrelated loudness paths.
+  if (cameraAmbientSource === null) {
+    cameraAmbientSource = context.createMediaElementSource(cameraAmbientAudio);
+    cameraAmbientGain = context.createGain();
+    cameraAmbientGain.gain.value = 0;
+    cameraAmbientSource.connect(cameraAmbientGain);
+    cameraAmbientGain.connect(masterBus);
+    cameraAmbientAudio.volume = 1;
+  }
+  if (footerAmbientSource === null) {
+    footerAmbientSource = context.createMediaElementSource(footerAmbientAudio);
+    footerAmbientGain = context.createGain();
+    footerAmbientGain.gain.value = 0;
+    footerAmbientSource.connect(footerAmbientGain);
+    footerAmbientGain.connect(masterBus);
+    footerAmbientAudio.volume = 1;
+  }
+
+  return context;
+}
+
+function silenceAmbientGain(gainNode) {
+  if (gainNode === null) return;
+
+  const now = gainNode.context.currentTime;
+  gainNode.gain.cancelScheduledValues(now);
+  gainNode.gain.setValueAtTime(0, now);
+}
+
+function scheduleAmbientGainEnvelope(gainNode, points) {
+  if (gainNode === null) return 0;
+
+  const now = gainNode.context.currentTime;
+  gainNode.gain.cancelScheduledValues(now);
+  gainNode.gain.setValueAtTime(0, now);
+  let elapsed = 0;
+
+  points.forEach(({ value, duration }) => {
+    elapsed += duration;
+    gainNode.gain.linearRampToValueAtTime(value, now + elapsed);
+  });
+
+  return elapsed;
+}
+
+async function ensureProjectAudioRunning() {
+  await ensureWebKitsAudioReady();
+  const context = configureProjectAudioGraph();
+
+  if (context.state !== "running") {
+    await context.resume();
+  }
+
+  webKitsAudioReady = context.state === "running";
+  if (!webKitsAudioReady) {
+    throw new Error(`AudioContext is ${context.state}`);
+  }
+
+  return context;
+}
+
+function withProjectAudioTimeout(promise) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      reject(new Error("Audio unlock timed out"));
+    }, PROJECT_AUDIO_UNLOCK_TIMEOUT_MS);
+
+    Promise.resolve(promise).then(resolve, reject).finally(() => {
+      window.clearTimeout(timeoutId);
+    });
+  });
+}
 
 function playClickStatePop() {
   if (!projectSoundEnabled) return;
@@ -214,10 +339,14 @@ function playFooterOrganGlyphSplash() {
 function playGalleryPop() {
   if (!projectSoundEnabled || !webKitsAudioReady) return;
 
-  playMinimalPopSound();
+  const now = performance.now();
+  if (now - galleryPopLastPlayedAt < GALLERY_POP_MIN_INTERVAL_MS) return;
+  galleryPopLastPlayedAt = now;
+
+  playMinimalPopSound({ volume: 0.72 });
 }
 
-function playCapabilityHighlightTap(volume = 1) {
+function playCapabilityHighlightTap(volume = CAPABILITY_HIGHLIGHT_INITIAL_TAP_VOLUME) {
   if (
     !projectSoundEnabled
     || !webKitsAudioReady
@@ -231,6 +360,10 @@ function playCapabilityHighlightTap(volume = 1) {
     return bounds.bottom > 0 && bounds.top < window.innerHeight;
   });
   if (!hasVisibleCard) return;
+
+  const now = performance.now();
+  if (now - capabilityTapLastPlayedAt < CAPABILITY_TAP_MIN_INTERVAL_MS) return;
+  capabilityTapLastPlayedAt = now;
 
   playMinimalTapSound({ volume });
 }
@@ -422,55 +555,54 @@ function startCameraAmbientSwell() {
   if (
     !projectSoundEnabled ||
     !cameraAmbientArmed ||
+    cameraAmbientGain === null ||
+    projectAudioContext?.state !== "running" ||
     cameraAmbientPlayPending ||
     cameraAmbientVolumeTimeline !== null
   ) return;
 
   cameraAmbientPlayPending = true;
+  const attempt = ++cameraAmbientAttempt;
   cameraAmbientAudio.pause();
-  cameraAmbientAudio.currentTime = 0;
-  cameraAmbientAudio.volume = 0;
+  safeSetMediaTime(cameraAmbientAudio, 0);
+  cameraAmbientAudio.volume = 1;
+  silenceAmbientGain(cameraAmbientGain);
 
   Promise.resolve(cameraAmbientAudio.play())
     .then(() => {
-      if (!cameraAmbientArmed || !isCameraAmbientContextActive()) {
+      if (
+        attempt !== cameraAmbientAttempt ||
+        !cameraAmbientArmed ||
+        !isCameraAmbientContextActive()
+      ) {
         cameraAmbientPlayPending = false;
         cameraAmbientAudio.pause();
-        cameraAmbientAudio.currentTime = 0;
-        cameraAmbientAudio.volume = 0;
+        safeSetMediaTime(cameraAmbientAudio, 0);
+        silenceAmbientGain(cameraAmbientGain);
         return;
       }
 
       cameraAmbientPlayPending = false;
       cameraAmbientArmed = false;
-      cameraAmbientVolumeTimeline = gsap.timeline({
-        onComplete() {
-          cameraAmbientAudio.pause();
-          cameraAmbientAudio.currentTime = 0;
-          cameraAmbientAudio.volume = 0;
-          cameraAmbientVolumeTimeline = null;
-        },
+      const envelopeDuration = scheduleAmbientGainEnvelope(cameraAmbientGain, [
+        { value: CAMERA_AMBIENT_RISE_VOLUME, duration: 0.45 },
+        { value: CAMERA_AMBIENT_PEAK_VOLUME, duration: 0.75 },
+        { value: 0, duration: 1.75 },
+      ]);
+      cameraAmbientVolumeTimeline = gsap.delayedCall(envelopeDuration, () => {
+        cameraAmbientAudio.pause();
+        safeSetMediaTime(cameraAmbientAudio, 0);
+        silenceAmbientGain(cameraAmbientGain);
+        cameraAmbientVolumeTimeline = null;
       });
-
-      cameraAmbientVolumeTimeline
-        .to(cameraAmbientAudio, {
-          volume: CAMERA_AMBIENT_RISE_VOLUME,
-          duration: 0.45,
-          ease: "sine.in",
-        })
-        .to(cameraAmbientAudio, {
-          volume: CAMERA_AMBIENT_PEAK_VOLUME,
-          duration: 0.75,
-          ease: "sine.out",
-        })
-        .to(cameraAmbientAudio, {
-          volume: 0,
-          duration: 1.75,
-          ease: "sine.inOut",
-        });
     })
     .catch(() => {
-      cameraAmbientPlayPending = false;
+      if (attempt === cameraAmbientAttempt) {
+        cameraAmbientPlayPending = false;
+        cameraAmbientPrimePromise = null;
+        cameraAmbientAudio.pause();
+        silenceAmbientGain(cameraAmbientGain);
+      }
     });
 }
 
@@ -496,21 +628,23 @@ function playCameraRenderAmbient() {
 }
 
 function stopCameraAmbientSwell() {
+  cameraAmbientAttempt += 1;
   cameraAmbientArmed = false;
   cameraAmbientPlayPending = false;
   cameraAmbientVolumeTimeline?.kill();
   cameraAmbientVolumeTimeline = null;
   cameraAmbientAudio.pause();
-  cameraAmbientAudio.currentTime = 0;
-  cameraAmbientAudio.volume = 0;
+  safeSetMediaTime(cameraAmbientAudio, 0);
+  silenceAmbientGain(cameraAmbientGain);
 }
 
 function primeCameraAmbientAudio() {
   if (cameraAmbientPrimePromise !== null) return;
 
   cameraAmbientAudio.pause();
-  cameraAmbientAudio.currentTime = 0;
-  cameraAmbientAudio.volume = 0;
+  safeSetMediaTime(cameraAmbientAudio, 0);
+  cameraAmbientAudio.volume = cameraAmbientGain === null ? 0 : 1;
+  silenceAmbientGain(cameraAmbientGain);
   let playbackAttempt;
   try {
     playbackAttempt = cameraAmbientAudio.play();
@@ -522,7 +656,7 @@ function primeCameraAmbientAudio() {
     .then(() => {
       if (cameraAmbientArmed || cameraAmbientVolumeTimeline !== null) return;
       cameraAmbientAudio.pause();
-      cameraAmbientAudio.currentTime = 0;
+      safeSetMediaTime(cameraAmbientAudio, 0);
     })
     .catch(() => {})
     .finally(() => {
@@ -534,75 +668,82 @@ function startFooterAmbientOutro() {
   if (
     !projectSoundEnabled ||
     document.body.dataset.currentPage !== "work" ||
+    footerAmbientGain === null ||
+    projectAudioContext?.state !== "running" ||
     footerAmbientPlayPending ||
     footerAmbientVolumeTimeline !== null
   ) return;
 
   footerAmbientPlayPending = true;
+  const attempt = ++footerAmbientAttempt;
   footerAmbientAudio.pause();
-  footerAmbientAudio.currentTime = FOOTER_AMBIENT_START_TIME;
+  safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
   footerAmbientAudio.playbackRate = 1;
-  footerAmbientAudio.volume = 0;
+  footerAmbientAudio.volume = 1;
+  silenceAmbientGain(footerAmbientGain);
 
   Promise.resolve(footerAmbientAudio.play())
     .then(() => {
-      if (!projectSoundEnabled || document.body.dataset.currentPage !== "work") {
+      if (
+        attempt !== footerAmbientAttempt ||
+        !projectSoundEnabled ||
+        document.body.dataset.currentPage !== "work"
+      ) {
         footerAmbientPlayPending = false;
         footerAmbientAudio.pause();
-        footerAmbientAudio.currentTime = FOOTER_AMBIENT_START_TIME;
+        safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
         footerAmbientAudio.playbackRate = 1;
-        footerAmbientAudio.volume = 0;
+        silenceAmbientGain(footerAmbientGain);
         return;
       }
 
       footerAmbientPlayPending = false;
-      footerAmbientVolumeTimeline = gsap.timeline({
-        onComplete() {
-          footerAmbientAudio.pause();
-          footerAmbientAudio.currentTime = FOOTER_AMBIENT_START_TIME;
-          footerAmbientAudio.playbackRate = 1;
-          footerAmbientAudio.volume = 0;
-          footerAmbientVolumeTimeline = null;
-        },
+      const holdDuration = Math.max(
+        0,
+        FOOTER_AMBIENT_DURATION - 0.12 - FOOTER_AMBIENT_FADE_OUT_DURATION,
+      );
+      const envelopeDuration = scheduleAmbientGainEnvelope(footerAmbientGain, [
+        { value: FOOTER_AMBIENT_VOLUME, duration: 0.12 },
+        { value: FOOTER_AMBIENT_VOLUME, duration: holdDuration },
+        { value: 0, duration: FOOTER_AMBIENT_FADE_OUT_DURATION },
+      ]);
+      footerAmbientVolumeTimeline = gsap.delayedCall(envelopeDuration, () => {
+        footerAmbientAudio.pause();
+        safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
+        footerAmbientAudio.playbackRate = 1;
+        silenceAmbientGain(footerAmbientGain);
+        footerAmbientVolumeTimeline = null;
       });
-
-      footerAmbientVolumeTimeline
-        .to(footerAmbientAudio, {
-          volume: FOOTER_AMBIENT_VOLUME,
-          duration: 0.12,
-          ease: "sine.out",
-        }, 0)
-        .to({}, {
-          duration: FOOTER_AMBIENT_DURATION - 0.12 - FOOTER_AMBIENT_FADE_OUT_DURATION,
-        })
-        .to(footerAmbientAudio, {
-          volume: 0,
-          duration: FOOTER_AMBIENT_FADE_OUT_DURATION,
-          ease: "sine.inOut",
-        });
     })
     .catch(() => {
-      footerAmbientPlayPending = false;
+      if (attempt === footerAmbientAttempt) {
+        footerAmbientPlayPending = false;
+        footerAmbientPrimePromise = null;
+        footerAmbientAudio.pause();
+        silenceAmbientGain(footerAmbientGain);
+      }
     });
 }
 
 function stopFooterAmbientOutro() {
+  footerAmbientAttempt += 1;
   footerAmbientPlayPending = false;
   footerAmbientVolumeTimeline?.kill();
   footerAmbientVolumeTimeline = null;
   footerAmbientAudio.pause();
-  footerAmbientAudio.currentTime = FOOTER_AMBIENT_START_TIME;
+  safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
   footerAmbientAudio.playbackRate = 1;
-  footerAmbientAudio.volume = 0;
+  silenceAmbientGain(footerAmbientGain);
 }
 
 function primeFooterAmbientAudio() {
   if (footerAmbientPrimePromise !== null) return;
 
   footerAmbientAudio.pause();
-  footerAmbientAudio.currentTime = FOOTER_AMBIENT_START_TIME;
+  safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
   footerAmbientAudio.playbackRate = 1;
-  footerAmbientAudio.volume = 0;
+  footerAmbientAudio.volume = footerAmbientGain === null ? 0 : 1;
+  silenceAmbientGain(footerAmbientGain);
 
   let playbackAttempt;
   try {
@@ -615,7 +756,7 @@ function primeFooterAmbientAudio() {
     .then(() => {
       if (footerAmbientPlayPending || footerAmbientVolumeTimeline !== null) return;
       footerAmbientAudio.pause();
-      footerAmbientAudio.currentTime = FOOTER_AMBIENT_START_TIME;
+      safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
     })
     .catch(() => {})
     .finally(() => {
@@ -624,7 +765,7 @@ function primeFooterAmbientAudio() {
 }
 
 function unlockProjectAudio(event) {
-  if (!projectSoundEnabled) return;
+  if (!projectSoundEnabled) return Promise.resolve();
 
   const eventTarget = event?.target;
   const navigationTarget = eventTarget instanceof Element
@@ -638,29 +779,46 @@ function unlockProjectAudio(event) {
     );
 
   if (
-    cameraAmbientArmed &&
-    isCameraAmbientContextActive() &&
-    isCameraInteraction
+    webKitsAudioReady &&
+    projectAudioContext?.state === "running"
   ) {
-    startCameraAmbientSwell();
+    if (
+      cameraAmbientArmed &&
+      isCameraAmbientContextActive() &&
+      isCameraInteraction
+    ) {
+      startCameraAmbientSwell();
+    }
+    return Promise.resolve(projectAudioContext);
   }
+  if (webKitsAudioUnlockPromise !== null) return webKitsAudioUnlockPromise;
 
-  if (webKitsAudioReady || webKitsAudioUnlockPromise !== null) return;
-
-  webKitsAudioUnlockPromise = ensureWebKitsAudioReady()
-    .then(() => {
-      webKitsAudioReady = true;
-      webKitsAudioUnlockPromise = null;
+  webKitsAudioUnlockPromise = withProjectAudioTimeout(ensureProjectAudioRunning())
+    .then((context) => {
+      if (
+        cameraAmbientArmed &&
+        isCameraAmbientContextActive() &&
+        isCameraInteraction
+      ) {
+        startCameraAmbientSwell();
+      }
       primeGlyphSplashSample();
       drainIntroHighlightSwooshQueue();
       if (pendingClickStatePop && projectSoundEnabled) {
         pendingClickStatePop = false;
         playMinimalPopSound();
       }
+      return context;
     })
     .catch(() => {
+      webKitsAudioReady = false;
+      return null;
+    })
+    .finally(() => {
       webKitsAudioUnlockPromise = null;
     });
+
+  return webKitsAudioUnlockPromise;
 }
 
 function setupProjectAudioUnlock() {
@@ -671,7 +829,12 @@ function setupProjectAudioUnlock() {
   window.addEventListener("touchend", unlockProjectAudio, options);
   window.addEventListener("mousedown", unlockProjectAudio, options);
   window.addEventListener("click", unlockProjectAudio, options);
+  window.addEventListener("wheel", unlockProjectAudio, options);
   window.addEventListener("keydown", unlockProjectAudio, { capture: true });
+  window.addEventListener("pageshow", unlockProjectAudio, { passive: true });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) unlockProjectAudio();
+  });
 }
 
 function setupClickStateAudio() {
@@ -781,7 +944,7 @@ const GLYPH_FAMILIES = [
   "8QMW",
   "WM80",
 ];
-const SCRAMBLE_INTERVAL = 0.075;
+const SCRAMBLE_INTERVAL = IS_SAFARI_BROWSER ? 0.11 : 0.075;
 const BLUE_LIGHT = { r: 78, g: 124, b: 255 };
 const BLUE_DARK = { r: 25, g: 67, b: 245 };
 const COVER_SCALE_BOOST = 1.08;
@@ -803,10 +966,10 @@ const FOOTER_WORD_EXPLOSION_DURATION = 0.54;
 const CELL_PADDING_RATIO = 0.07;
 const GLYPH_FONT_WEIGHT = 420;
 const FONT_SIZE_MULTIPLIER = 2.46;
-const CAMERA_MAX_DPR = 1.5;
+const CAMERA_MAX_DPR = IS_SAFARI_BROWSER ? 1 : 1.5;
 const CAMERA_MASK_THRESHOLD = 220;
 const CAMERA_MASK_FEATHER = 26;
-const CAMERA_FRAME_BLEND_PRECISION = 24;
+const CAMERA_FRAME_BLEND_PRECISION = IS_SAFARI_BROWSER ? 2 : 24;
 const CAMERA_GLYPH_CACHE_LIMIT = 18;
 const CAMERA_TEMPORAL_BLEND_ALPHA = 0.045;
 const EYPIECE_FRAME_INDEX = 46;
@@ -869,7 +1032,7 @@ const INTRO_OWL_LOOP_DURATION = 8;
 const INTRO_OWL_LOOP_END_FRAME = Number.POSITIVE_INFINITY;
 const INTRO_OWL_GLYPH_CACHE_LIMIT = 24;
 const INTRO_OWL_CLIP_MASK_CACHE_LIMIT = 24;
-const INTRO_OWL_FRAME_BLEND_PRECISION = 512;
+const INTRO_OWL_FRAME_BLEND_PRECISION = IS_SAFARI_BROWSER ? 2 : 512;
 const INTRO_OWL_TARGET_FPS = 30;
 const INTRO_OWL_TEMPORAL_BLEND_ALPHA = 0.025;
 const INTRO_OWL_BLUE_LIGHT = { r: 60, g: 102, b: 255 };
@@ -889,6 +1052,7 @@ const WORK_OWL_SCENE_START_MARGIN_RATIO = 0.62;
 const WORK_OWL_SCENE_START_FRAME_RATIO = 0.28;
 const WORK_OWL_TARGET_FPS = 30;
 const SAFARI_INTRO_OWL_TARGET_FPS = 24;
+const SAFARI_CAMERA_TARGET_FPS = 30;
 const SAFARI_WORK_OWL_ACTIVE_TARGET_FPS = 18;
 const SAFARI_WORK_OWL_SETTLED_TARGET_FPS = 24;
 const FOOTER_GLITCH_DOT_HOLD = 0.15;
@@ -970,7 +1134,7 @@ function getWorkWaveSourceIndex(displayIndex) {
 const WORK_WAVE_DIAGONAL_X_DRIFT_RATIO = 0.7;
 const WORK_WAVE_START_RIGHT_OFFSET_RATIO = 0.18;
 const WORK_WAVE_RIGHT_SHIFT_RATIO = 0.055;
-const WORK_FOOTER_SCENE_MAX_DPR = 1.5;
+const WORK_FOOTER_SCENE_MAX_DPR = IS_SAFARI_BROWSER ? 1 : 1.5;
 const WORK_FOOTER_SCENE_FONT_WEIGHT = 480;
 const WORK_FOOTER_SCENE_FONT_SIZE_MULTIPLIER = 1.16;
 const WORK_FOOTER_SCENE_CELL_PADDING_RATIO = 0.19;
@@ -1559,6 +1723,7 @@ let introRevealScrollTrigger = null;
 let introOwlDataPromise = null;
 let deferredVisualWarmupScheduled = false;
 let capabilityCardAssetWarmupPromise = null;
+let workWaveAssetWarmupPromise = null;
 let introOwlAssemblyPending = false;
 let introOwlAssemblyTimeline = null;
 let introOwlExitTimeline = null;
@@ -1579,6 +1744,10 @@ let cameraCursorScrambleUpdate = null;
 let cameraCursorLastX = window.innerWidth * 0.5;
 let cameraCursorLastY = window.innerHeight * 0.5;
 let smoothScroller = null;
+let workScrollVelocity = 0;
+let workScrollFast = false;
+let workScrollSettleTimer = 0;
+let cameraLastRenderTime = Number.NEGATIVE_INFINITY;
 let cameraScrollTrigger = null;
 let cameraTemporalCanvas = null;
 let cameraTemporalCtx = null;
@@ -1607,6 +1776,7 @@ let introRevealStartRetryTimer = null;
 let navSelectionTimeline = null;
 let workWaveImageItems = [];
 let workWaveImageFrames = [];
+let workWaveImages = [];
 let workWaveImageMetrics = [];
 let workWaveImageProgress = [];
 let workWaveScrollTriggers = [];
@@ -2162,6 +2332,11 @@ function chooseStartupEntry(soundEnabled, event) {
   startupEnterSilentButton?.setAttribute("disabled", "");
   startupLoader?.setAttribute("aria-busy", "true");
 
+  const finishStartupChoice = () => {
+    resolveStartupEntryChoice?.(soundEnabled);
+    resolveStartupEntryChoice = null;
+  };
+
   if (soundEnabled) {
     try {
       // Unity gain made Safari's unlocked Web Audio voices and the separately
@@ -2172,8 +2347,10 @@ function chooseStartupEntry(soundEnabled, event) {
     }
     primeCameraAmbientAudio();
     primeFooterAmbientAudio();
-    unlockProjectAudio(event);
+    const unlockAttempt = unlockProjectAudio(event);
     playClickStatePop();
+    Promise.resolve(unlockAttempt).finally(finishStartupChoice);
+    return;
   } else {
     pendingClickStatePop = false;
     pendingGlyphSplash = false;
@@ -2181,8 +2358,7 @@ function chooseStartupEntry(soundEnabled, event) {
     stopFooterAmbientOutro();
   }
 
-  resolveStartupEntryChoice?.(soundEnabled);
-  resolveStartupEntryChoice = null;
+  finishStartupChoice();
 }
 
 function setupStartupEntry() {
@@ -2898,8 +3074,22 @@ function scrollWorkRouteToHero() {
   });
 }
 
-function updateVisibleScrollTriggers() {
+function updateVisibleScrollTriggers(scrollState = null) {
   if (activePageId !== "work") return;
+
+  if (scrollState && Number.isFinite(scrollState.velocity)) {
+    workScrollVelocity = Math.abs(scrollState.velocity);
+    workScrollFast = workScrollVelocity >= 22;
+
+    window.clearTimeout(workScrollSettleTimer);
+    workScrollSettleTimer = window.setTimeout(() => {
+      workScrollVelocity = 0;
+      workScrollFast = false;
+      requestCameraRender();
+      syncWorkWaveGalleryToScroll();
+      ScrollTrigger.update();
+    }, 120);
+  }
 
   ScrollTrigger.update();
 }
@@ -6238,6 +6428,9 @@ function activateIntroOwlLoopNow() {
   introOwlState.currentFrameBucket = -1;
   introOwlState.currentScrambleBucket = -1;
 
+  if (introFrame instanceof HTMLElement) {
+    gsap.set(introFrame, { y: 0, autoAlpha: 1 });
+  }
   gsap.set(introOwlFlightLayer, { opacity: 1 });
   introOwlCanvas.classList.remove("is-work-owl");
   gsap.set(introOwlCanvas, {
@@ -6294,6 +6487,9 @@ function playIntroOwlAssembly(onComplete = null) {
   }
 
   introOwlAssemblyTimeline?.kill();
+  if (introFrame instanceof HTMLElement) {
+    gsap.set(introFrame, { y: 0, autoAlpha: 1 });
+  }
   if (introOwlFlightLayer instanceof HTMLElement) {
     gsap.set(introOwlFlightLayer, { opacity: 1 });
   }
@@ -7108,6 +7304,9 @@ function forceCompleteIntroReveal() {
     if (introOwlFlightLayer instanceof HTMLElement) {
       gsap.set(introOwlFlightLayer, { opacity: 1 });
     }
+    if (introFrame instanceof HTMLElement) {
+      gsap.set(introFrame, { y: 0, autoAlpha: 1 });
+    }
   }
 
   gsap.set(words, {
@@ -7196,6 +7395,19 @@ function requestIntroTyperRevealAfterCamera() {
     return;
   }
 
+  // The text and owl are one reveal. On a cold Safari visit the 5.4 MB owl
+  // data used to begin loading from an idle callback, so the failsafe could
+  // finish the text and unlock scrolling before the owl existed.
+  if (!isIntroOwlDataReady()) {
+    loadIntroOwlData()
+      .then(requestIntroTyperRevealAfterCamera)
+      .catch((error) => {
+        console.error("Unable to prepare the intro owl reveal.", error);
+        playIntroTyperReveal();
+      });
+    return;
+  }
+
   playIntroTyperReveal();
 }
 
@@ -7235,6 +7447,13 @@ function playIntroTyperReveal() {
 
   const words = splitIntroCopyIntoWords();
   if (!words.length) return;
+
+  // The fixed intro frame replaces Safari's independently composited sticky
+  // release. Make its required baseline visible at the exact camera handoff;
+  // ScrollTrigger considers that boundary progress 0 until the next pixel.
+  if (introFrame instanceof HTMLElement) {
+    gsap.set(introFrame, { y: 0, autoAlpha: 1 });
+  }
 
   introTyperHasPlayed = true;
 
@@ -8541,14 +8760,23 @@ function setupCameraRenderLoop() {
     }
 
     const scrambleChanged =
+      !workScrollFast &&
       Math.floor(time / SCRAMBLE_INTERVAL) !== state.currentScrambleBucket;
+    const safariFrameReady =
+      !IS_SAFARI_BROWSER ||
+      time - cameraLastRenderTime >= 1 / SAFARI_CAMERA_TARGET_FPS;
 
     if (
       cameraPlaybackState.renderRequested ||
       progressChanged ||
       scrambleChanged
     ) {
-      renderCurrentProgress();
+      if (safariFrameReady) {
+        cameraLastRenderTime = time;
+        renderCurrentProgress();
+      } else if (progressChanged) {
+        cameraPlaybackState.renderRequested = true;
+      }
     }
 
     if (
@@ -8634,7 +8862,9 @@ function setupIntroOwlScramble() {
     }
 
     const targetFps = IS_SAFARI_BROWSER
-      ? SAFARI_INTRO_OWL_TARGET_FPS
+      ? workScrollFast
+        ? 12
+        : SAFARI_INTRO_OWL_TARGET_FPS
       : INTRO_OWL_TARGET_FPS;
     const minimumFrameInterval = 1 / targetFps;
     if (time - introOwlState.lastRenderTime < minimumFrameInterval) return;
@@ -8648,7 +8878,9 @@ function setupIntroOwlScramble() {
     const frameBucket = Math.round(
       framePosition * INTRO_OWL_FRAME_BLEND_PRECISION,
     );
-    const scrambleBucket = Math.floor(time / SCRAMBLE_INTERVAL);
+    const scrambleBucket = workScrollFast && introOwlState.currentScrambleBucket >= 0
+      ? introOwlState.currentScrambleBucket
+      : Math.floor(time / SCRAMBLE_INTERVAL);
 
     if (
       frameBucket === introOwlState.currentFrameBucket &&
@@ -8667,22 +8899,28 @@ function setupIntroOwlScramble() {
 }
 
 function setupSmoothScroll() {
+  ScrollTrigger.config({ ignoreMobileResize: true });
+
   const lenis = new Lenis({
-    wheelMultiplier: 1,
+    autoRaf: true,
+    wheelMultiplier: IS_SAFARI_BROWSER ? 0.9 : 1,
     touchMultiplier: 1,
-    touchInertiaMultiplier: 30,
-    lerp: 0.18,
+    touchInertiaExponent: 1.7,
+    syncTouchLerp: 0.075,
+    lerp: IS_SAFARI_BROWSER ? 0.16 : 0.18,
     smoothWheel: true,
-    syncTouch: true,
+    // Native WebKit touch momentum is already excellent and avoids a second
+    // main-thread scroll authority on iPhone/iPad Safari.
+    syncTouch: !IS_SAFARI_BROWSER,
   });
 
   smoothScroller = lenis;
   lenis.on("scroll", updateVisibleScrollTriggers);
 
-  gsap.ticker.add((time) => {
-    lenis.raf(time * 1000);
-  });
-  gsap.ticker.lagSmoothing(0);
+  // Lenis owns its native rAF while GSAP retains lag protection for the
+  // time-based decorative timelines. Coupling both to one ticker made a
+  // heavy canvas frame stall scrolling, audio fades, and footer sequencing.
+  gsap.ticker.lagSmoothing(500, 33);
 }
 
 function setupScroll() {
@@ -9414,6 +9652,9 @@ function setIntroOwlExitSuspendedForWork(isSuspended) {
     if (introOwlFlightLayer instanceof HTMLElement) {
       gsap.set(introOwlFlightLayer, { x: 0, y: 0 });
     }
+    if (introFrame instanceof HTMLElement) {
+      gsap.set(introFrame, { y: 0 });
+    }
 
     return;
   }
@@ -9425,6 +9666,10 @@ function setIntroOwlExitSuspendedForWork(isSuspended) {
 function setIntroOwlFlightLayerActive(isActive) {
   if (!(introOwlFlightLayer instanceof HTMLElement)) return;
   const workOwlBlocksIntro = isWorkOwlSceneBlockingIntro();
+
+  if (isActive && introFrame instanceof HTMLElement) {
+    gsap.set(introFrame, { autoAlpha: 1 });
+  }
 
   if (!isActive && workOwlBlocksIntro) {
     introOwlLoopVisible = false;
@@ -9462,6 +9707,7 @@ function setIntroOwlFlightLayerActive(isActive) {
 function setupIntroOwlExit() {
   if (
     !(introSection instanceof HTMLElement) ||
+    !(introFrame instanceof HTMLElement) ||
     !(introOwlFlightLayer instanceof HTMLElement) ||
     !(introOwlCanvas instanceof HTMLCanvasElement)
   ) {
@@ -9472,6 +9718,7 @@ function setupIntroOwlExit() {
   introOwlExitScrollTrigger?.kill();
   introOwlPresenceScrollTrigger?.kill();
   gsap.set(introOwlFlightLayer, { x: 0, y: 0 });
+  gsap.set(introFrame, { y: 0, autoAlpha: 0 });
   setIntroOwlFlightLayerActive(false);
 
   const reduceMotion = window.matchMedia(
@@ -9479,6 +9726,16 @@ function setupIntroOwlExit() {
   ).matches;
 
   introOwlExitTimeline = gsap.timeline({ paused: true });
+  introOwlExitTimeline.to(
+    introFrame,
+    {
+      y: () => -window.innerHeight,
+      duration: 1,
+      ease: "none",
+      force3D: true,
+    },
+    0,
+  );
   introOwlExitTimeline.to(
     introOwlFlightLayer,
     {
@@ -9522,16 +9779,27 @@ function setupIntroOwlExit() {
     start: "top top",
     end: "bottom top",
     onEnter() {
+      gsap.set(introFrame, { autoAlpha: 1 });
       setIntroOwlFlightLayerActive(true);
     },
     onEnterBack() {
+      gsap.set(introFrame, { autoAlpha: 1 });
       setIntroOwlFlightLayerActive(true);
     },
+    onLeave() {
+      gsap.set(introFrame, { autoAlpha: 0 });
+      setIntroOwlFlightLayerActive(false);
+    },
     onLeaveBack() {
+      gsap.set(introFrame, { autoAlpha: 0 });
       setIntroOwlFlightLayerActive(false);
     },
     onRefresh(self) {
-      setIntroOwlFlightLayerActive(self.isActive);
+      const bounds = introSection.getBoundingClientRect();
+      const isAtIntroStart = bounds.top <= 1 && bounds.bottom > 1;
+      const shouldBeActive = self.isActive || isAtIntroStart;
+      gsap.set(introFrame, { autoAlpha: shouldBeActive ? 1 : 0 });
+      setIntroOwlFlightLayerActive(shouldBeActive);
     },
   });
 }
@@ -11256,7 +11524,9 @@ function setupWorkOwlRenderLoop() {
     }
 
     const targetFps = IS_SAFARI_BROWSER
-      ? footerInteractionState === "playing"
+      ? workScrollFast
+        ? 12
+        : footerInteractionState === "playing"
         ? SAFARI_WORK_OWL_ACTIVE_TARGET_FPS
         : SAFARI_WORK_OWL_SETTLED_TARGET_FPS
       : WORK_OWL_TARGET_FPS;
@@ -11285,7 +11555,9 @@ function setupWorkOwlRenderLoop() {
     const frameBucket = Math.round(
       framePosition * INTRO_OWL_FRAME_BLEND_PRECISION,
     );
-    const scrambleBucket = Math.floor(time / SCRAMBLE_INTERVAL);
+    const scrambleBucket = workScrollFast && workOwlRenderState.currentScrambleBucket >= 0
+      ? workOwlRenderState.currentScrambleBucket
+      : Math.floor(time / SCRAMBLE_INTERVAL);
 
     if (
       frameBucket === workOwlRenderState.currentFrameBucket &&
@@ -11554,8 +11826,32 @@ function setupWorkOwlScene() {
     start: "top bottom",
     end: "bottom bottom",
     invalidateOnRefresh: true,
-    onEnter: playFooterInteraction,
+    onEnter(self) {
+      if (self.progress > 0.72 && (workScrollFast || Math.abs(self.getVelocity()) > 1600)) {
+        setFooterInteractionFinal();
+        return;
+      }
+      playFooterInteraction();
+    },
     onEnterBack: playFooterInteraction,
+    onUpdate(self) {
+      if (document.body.dataset.currentPage !== "work") return;
+
+      // `bottom bottom` is the maximum document scroll, so Safari can reach
+      // progress 1 without ever firing onLeave. The final footer state must be
+      // derived from absolute progress, not from dwelling for 4.5 seconds.
+      if (
+        self.progress >= 0.998 ||
+        (
+          self.progress >= 0.76 &&
+          (workScrollFast || Math.abs(self.getVelocity()) > 1800)
+        )
+      ) {
+        if (footerInteractionState !== "complete") {
+          setFooterInteractionFinal();
+        }
+      }
+    },
     onLeave() {
       if (document.body.dataset.currentPage !== "work") return;
 
@@ -11563,7 +11859,7 @@ function setupWorkOwlScene() {
       // the document bottom the footer is still visible, so start (or resume)
       // the sequence even though ScrollTrigger now reports progress 1.
       if (isFooterSceneVisible()) {
-        playFooterInteraction();
+        setFooterInteractionFinal();
       }
     },
     onLeaveBack() {
@@ -11577,9 +11873,13 @@ function setupWorkOwlScene() {
       if (document.body.dataset.currentPage !== "work") return;
 
       if (
-        self.isActive ||
-        (self.progress >= 1 && isFooterSceneVisible())
+        self.progress >= 0.998 && isFooterSceneVisible()
       ) {
+        setFooterInteractionFinal();
+        return;
+      }
+
+      if (self.isActive) {
         playFooterInteraction();
         return;
       }
@@ -11608,17 +11908,19 @@ function getWorkWaveImageHeight(index, sizeFactor) {
 function setWorkWaveStaticFrame() {
   workWaveImageItems.forEach((imageItem, index) => {
     const imageFrame = workWaveImageFrames[index];
+    const image = workWaveImages[index];
     const metric = workWaveImageMetrics[index];
-    if (!(imageFrame instanceof HTMLElement)) return;
+    if (!(imageFrame instanceof HTMLElement) || !(image instanceof HTMLImageElement)) return;
 
     const imageWidth = metric?.width ?? 0;
     const translateX =
       (workWaveViewportWidth - imageWidth) / 2 +
       workWaveViewportWidth * WORK_WAVE_RIGHT_SHIFT_RATIO;
-    imageFrame.style.transform = `translate3d(${translateX}px, 0px, 0)`;
-    imageFrame.style.clipPath = "inset(0 0% 0 0%)";
+    imageFrame.style.transform = `translate3d(${translateX}px, 0px, 0) scaleX(1)`;
+    image.style.transform = "scaleX(1)";
     imageFrame.style.opacity = "1";
     imageFrame.style.visibility = "visible";
+    imageFrame.classList.add("is-render-active");
   });
 }
 
@@ -11648,7 +11950,14 @@ function updateWorkWaveImageSizes() {
   }
 }
 
-function updateWorkWaveImageFrame(imageFrame, normalizedIndex, progress, metric) {
+function updateWorkWaveImageFrame(
+  imageFrame,
+  image,
+  normalizedIndex,
+  progress,
+  metric,
+  forceVisible = false,
+) {
   const { base, flow, detail } = WORK_WAVE_CONFIG.waves;
   const viewportWidth = workWaveViewportWidth || window.innerWidth;
   const viewportHeight = workWaveViewportHeight || window.innerHeight;
@@ -11684,40 +11993,74 @@ function updateWorkWaveImageFrame(imageFrame, normalizedIndex, progress, metric)
   const centerOffset = Math.abs(progress - 0.5) * 2;
   const clipAmount =
     Math.pow(centerOffset, WORK_WAVE_CONFIG.clipPower) * WORK_WAVE_CONFIG.clipMax;
+  const cropScale = Math.max(0.55, 1 - clipAmount * 0.02);
+  const isVisible = forceVisible || (progress > 0.001 && progress < 0.999);
 
   imageFrame.style.transform =
-    `translate3d(${translateX}px, ${translateY}px, 0)`;
-  imageFrame.style.clipPath = `inset(0 ${clipAmount}% 0 ${clipAmount}%)`;
-  imageFrame.style.opacity = progress > 0.001 && progress < 0.999 ? "1" : "0";
-  imageFrame.style.visibility = progress > 0.001 && progress < 0.999
-    ? "visible"
-    : "hidden";
+    `translate3d(${translateX}px, ${translateY}px, 0) scaleX(${cropScale})`;
+  image.style.transform = `scaleX(${1 / cropScale})`;
+  imageFrame.style.opacity = isVisible ? "1" : "0";
+  imageFrame.style.visibility = isVisible ? "visible" : "hidden";
+  imageFrame.classList.toggle("is-render-active", isVisible);
 }
 
-function syncWorkWaveGalleryToScroll() {
+function syncWorkWaveGalleryToScroll(direction = 1, velocity = workScrollVelocity) {
   if (activePageId !== "work" || workWaveScrollTriggers.length === 0) return;
 
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduceMotion) {
+    setWorkWaveStaticFrame();
+    return;
+  }
 
-  workWaveScrollTriggers.forEach((trigger, index) => {
-    const imageFrame = workWaveImageFrames[index];
-    if (!(imageFrame instanceof HTMLElement)) return;
+  // Read every bound first, then write every transform. A single canonical
+  // renderer means a coalesced Safari scroll event cannot skip an item's
+  // trigger and leave the whole gallery blank.
+  const viewportHeight = workWaveViewportHeight || window.innerHeight;
+  const itemRects = workWaveImageItems.map((item) => item.getBoundingClientRect());
+  const containerRect = workWaveImagesContainer.getBoundingClientRect();
+  const galleryVisible = containerRect.bottom > 0 && containerRect.top < viewportHeight;
+  let canonicalIndex = -1;
+  let canonicalDistance = Number.POSITIVE_INFINITY;
 
-    const normalizedIndex = index / (WORK_WAVE_TOTAL_IMAGES - 1);
-    const progress = clamp(trigger.progress ?? 0, 0, 1);
+  itemRects.forEach((rect, index) => {
+    const progress = clamp(
+      (viewportHeight - rect.top) / Math.max(1, viewportHeight + rect.height),
+      0,
+      1,
+    );
     workWaveImageProgress[index] = progress;
 
-    if (!reduceMotion) {
-      updateWorkWaveImageFrame(
-        imageFrame,
-        normalizedIndex,
-        progress,
-        workWaveImageMetrics[index],
-      );
+    const distance = Math.abs(rect.top + rect.height * 0.5 - viewportHeight * 0.5);
+    if (distance < canonicalDistance) {
+      canonicalDistance = distance;
+      canonicalIndex = index;
     }
   });
 
-  scheduleWorkWaveCaption(1, 0);
+  if (galleryVisible && canonicalIndex >= 0) {
+    workWaveImageProgress[canonicalIndex] = clamp(
+      workWaveImageProgress[canonicalIndex],
+      0.002,
+      0.998,
+    );
+  }
+
+  workWaveImageFrames.forEach((imageFrame, index) => {
+    const image = workWaveImages[index];
+    if (!(imageFrame instanceof HTMLElement) || !(image instanceof HTMLImageElement)) return;
+
+    updateWorkWaveImageFrame(
+      imageFrame,
+      image,
+      index / (WORK_WAVE_TOTAL_IMAGES - 1),
+      workWaveImageProgress[index],
+      workWaveImageMetrics[index],
+      galleryVisible && index === canonicalIndex,
+    );
+  });
+
+  scheduleWorkWaveCaption(direction, velocity);
 }
 
 function setupWorkWaveCaption() {
@@ -11814,6 +12157,7 @@ function setupWorkWaveGallery() {
   workWaveScrollTriggers = [];
   workWaveImageItems = [];
   workWaveImageFrames = [];
+  workWaveImages = [];
   workWaveImageMetrics = [];
   workWaveImageProgress = Array(WORK_WAVE_TOTAL_IMAGES).fill(0);
   workWaveActiveIndex = -1;
@@ -11832,56 +12176,44 @@ function setupWorkWaveGallery() {
     const image = document.createElement("img");
     image.src = `/work-wave/img${sourceIndex + 1}.webp`;
     image.alt = "";
-    image.loading = "lazy";
+    image.loading = "eager";
     image.decoding = "async";
+    image.setAttribute("fetchpriority", "low");
 
     imageFrame.appendChild(image);
     imageItem.appendChild(imageFrame);
     workWaveImagesContainer.appendChild(imageItem);
     workWaveImageItems.push(imageItem);
     workWaveImageFrames.push(imageFrame);
+    workWaveImages.push(image);
   }
 
   updateWorkWaveImageSizes();
 
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  workWaveImageItems.forEach((imageItem, index) => {
-    const imageFrame = workWaveImageFrames[index];
-    if (!(imageFrame instanceof HTMLElement)) return;
-
-    const normalizedIndex = index / (WORK_WAVE_TOTAL_IMAGES - 1);
-    const scrollTrigger = ScrollTrigger.create({
-      trigger: imageItem,
-      start: "top bottom",
-      end: "bottom top",
-      invalidateOnRefresh: true,
-      onUpdate: (self) => {
-        if (activePageId !== "work") return;
-
-        workWaveImageProgress[index] = self.progress;
-        if (!reduceMotion) {
-          updateWorkWaveImageFrame(
-            imageFrame,
-            normalizedIndex,
-            self.progress,
-            workWaveImageMetrics[index],
-          );
-        }
-        scheduleWorkWaveCaption(self.direction, self.getVelocity());
-      },
-    });
-
-    workWaveScrollTriggers.push(scrollTrigger);
-    if (!reduceMotion) {
-      updateWorkWaveImageFrame(
-        imageFrame,
-        normalizedIndex,
-        0,
-        workWaveImageMetrics[index],
-      );
-    }
+  const galleryTrigger = ScrollTrigger.create({
+    trigger: workWaveImagesContainer,
+    start: "top bottom",
+    end: "bottom top",
+    invalidateOnRefresh: true,
+    onUpdate: (self) => {
+      if (activePageId !== "work") return;
+      syncWorkWaveGalleryToScroll(self.direction, self.getVelocity());
+    },
+    onRefresh: (self) => {
+      if (activePageId !== "work") return;
+      updateWorkWaveImageSizes();
+      syncWorkWaveGalleryToScroll(self.direction, self.getVelocity());
+    },
+    onLeave: () => syncWorkWaveGalleryToScroll(1, 0),
+    onLeaveBack: () => syncWorkWaveGalleryToScroll(-1, 0),
   });
+  workWaveScrollTriggers.push(galleryTrigger);
+
+  if (!reduceMotion) {
+    syncWorkWaveGalleryToScroll(1, 0);
+  }
 }
 
 function createGlyphBurstState(canvas) {
@@ -12263,6 +12595,7 @@ function setupCapabilityCards() {
   };
 
   const cleanupCapabilityCards = () => {
+    document.body.classList.remove("capability-cards-active");
     cleanupBlueRunners();
     stopCapabilityGlyphBurst();
   };
@@ -12363,7 +12696,10 @@ function setupCapabilityCards() {
   const moveBlueRunner = (
     cardIndex,
     runnerIndex,
-    { immediate = false, tapVolume = 1 } = {},
+    {
+      immediate = false,
+      tapVolume = CAPABILITY_HIGHLIGHT_INITIAL_TAP_VOLUME,
+    } = {},
   ) => {
     const state = blueRunnerStates[cardIndex];
     const runner = state?.runners?.[runnerIndex];
@@ -12412,7 +12748,9 @@ function setupCapabilityCards() {
         state.calls[runnerIndex]?.kill?.();
         state.calls[runnerIndex] = gsap.delayedCall(
           1.15 + Math.random() * 1.55,
-          () => moveBlueRunner(cardIndex, runnerIndex),
+          () => moveBlueRunner(cardIndex, runnerIndex, {
+            tapVolume: CAPABILITY_HIGHLIGHT_INITIAL_TAP_VOLUME,
+          }),
         );
       },
     });
@@ -12610,7 +12948,9 @@ function setupCapabilityCards() {
           progress >= CAPABILITY_GLYPH_BURST_TRIGGER_PROGRESS
         ) {
           glyphBurstArmed = false;
-          playCapabilityGlyphBurst();
+          if (!workScrollFast) {
+            playCapabilityGlyphBurst();
+          }
         }
         previousCardsProgress = progress;
 
@@ -12710,9 +13050,37 @@ function setupCapabilityCards() {
         scrub: true,
         invalidateOnRefresh: true,
         onUpdate: (self) => updateCards(self.progress),
+        onEnter: (self) => {
+          document.body.classList.add("capability-cards-active");
+          updateCards(self.progress);
+        },
+        onEnterBack: (self) => {
+          document.body.classList.add("capability-cards-active");
+          updateCards(self.progress);
+        },
+        onLeave: () => {
+          updateCards(1);
+          document.body.classList.remove("capability-cards-active");
+          cleanupBlueRunners();
+          stopCapabilityGlyphBurst();
+        },
+        onLeaveBack: () => {
+          updateCards(0);
+          document.body.classList.remove("capability-cards-active");
+          cleanupBlueRunners();
+          stopCapabilityGlyphBurst();
+        },
         onRefresh: (self) => {
           refreshCardMetrics();
           updateCards(self.progress);
+          document.body.classList.toggle(
+            "capability-cards-active",
+            self.isActive,
+          );
+          if (!self.isActive) {
+            cleanupBlueRunners();
+            stopCapabilityGlyphBurst();
+          }
         },
       });
 
@@ -14543,7 +14911,7 @@ function warmCapabilityCardAssets() {
   capabilityCardAssetWarmupPromise = (async () => {
     capabilityCardImages.forEach((image) => {
       image.loading = "eager";
-      image.setAttribute("fetchpriority", "low");
+      image.setAttribute("fetchpriority", "auto");
     });
 
     await Promise.all(capabilityCardImages.map(waitForCapabilityCardImage));
@@ -14559,6 +14927,29 @@ function warmCapabilityCardAssets() {
   })();
 
   return capabilityCardAssetWarmupPromise;
+}
+
+function warmWorkWaveAssets() {
+  if (workWaveAssetWarmupPromise !== null) {
+    return workWaveAssetWarmupPromise;
+  }
+
+  workWaveAssetWarmupPromise = (async () => {
+    workWaveImages.forEach((image) => {
+      image.loading = "eager";
+      image.setAttribute("fetchpriority", "auto");
+    });
+
+    await Promise.all(workWaveImages.map(waitForCapabilityCardImage));
+    for (const image of workWaveImages) {
+      if (typeof image.decode === "function" && image.naturalWidth > 0) {
+        await image.decode().catch(() => {});
+      }
+      await new Promise((resolve) => window.requestAnimationFrame(resolve));
+    }
+  })();
+
+  return workWaveAssetWarmupPromise;
 }
 
 function prewarmDeferredCanvasEffects() {
@@ -14579,9 +14970,17 @@ function scheduleDeferredVisualWarmup() {
   if (deferredVisualWarmupScheduled) return;
 
   deferredVisualWarmupScheduled = true;
-  const warmup = () => {
-    // Keep these queues independent: a slow card image must never postpone
-    // the footer owl's first decoded/rendered frame.
+  // Start network and decode work as soon as the startup cover is released;
+  // requestIdleCallback can arrive after a fast user has already reached the
+  // gallery or cards on Safari.
+  warmCapabilityCardAssets().catch((error) => {
+    console.error("Unable to warm the capability card assets.", error);
+  });
+  warmWorkWaveAssets().catch((error) => {
+    console.error("Unable to warm the gallery assets.", error);
+  });
+
+  const warmCanvasEffects = () => {
     loadIntroOwlData()
       .then(() => new Promise((resolve) => window.requestAnimationFrame(resolve)))
       .then(() => {
@@ -14592,18 +14991,14 @@ function scheduleDeferredVisualWarmup() {
       .catch((error) => {
         console.error("Unable to warm the deferred owl visuals.", error);
       });
-
-    warmCapabilityCardAssets().catch((error) => {
-      console.error("Unable to warm the capability card assets.", error);
-    });
   };
 
   if ("requestIdleCallback" in window) {
-    window.requestIdleCallback(warmup, { timeout: 2400 });
+    window.requestIdleCallback(warmCanvasEffects, { timeout: 1200 });
     return;
   }
 
-  window.setTimeout(warmup, 700);
+  window.setTimeout(warmCanvasEffects, 320);
 }
 
 function settleWithTimeout(promise, timeoutMs) {
@@ -14952,6 +15347,11 @@ async function boot() {
   setupStartupEntry();
   updateIntroScale();
   setupShellInteractions();
+  // Fetch the intro owl in parallel with the camera data while the startup
+  // cover is still visible. It must never be a first-scroll lazy dependency.
+  const introOwlPreload = loadIntroOwlData().catch((error) => {
+    console.error("Unable to preload the intro owl data.", error);
+  });
   await loadFrameData();
   window.scrollTo(0, 0);
   updateIntroScale();
@@ -14988,6 +15388,13 @@ async function boot() {
   resetRouteScrollToTop();
   ScrollTrigger.update();
   await startupEntryChoice;
+  warmCapabilityCardAssets().catch((error) => {
+    console.error("Unable to warm the capability card assets.", error);
+  });
+  warmWorkWaveAssets().catch((error) => {
+    console.error("Unable to warm the gallery assets.", error);
+  });
+  await introOwlPreload;
   resetIntroTyperReveal();
   resetRouteScrollToTop();
   ScrollTrigger.update();

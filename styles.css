@@ -65,7 +65,7 @@
   --bg: #fdfcf8;
   --glyph-blue: rgb(25, 67, 245);
   --intro-highlight-blue: #2f56ff;
-  --intro-scroll-length: 230vh;
+  --intro-scroll-length: 230svh;
   --ink: #0a0a0a;
   --muted-ink: #949494;
   --nav-selection: #ededed;
@@ -564,11 +564,15 @@ body[data-current-page="experience"] .empty-route-page {
 }
 
 .intro-frame {
-  position: sticky;
+  position: fixed;
+  z-index: 1;
   top: 0;
+  left: 0;
   width: 100vw;
   height: 100svh;
   margin: 0 auto;
+  visibility: hidden;
+  opacity: 0;
   background: var(--bg);
   font-synthesis: none;
   overflow: hidden;
@@ -1145,8 +1149,8 @@ html.is-about-story-ready .about-story {
   position: absolute;
   inset: 0;
   overflow: hidden;
-  clip-path: inset(0 20% 0 20%);
-  will-change: transform, clip-path;
+  transform-origin: 50% 50%;
+  will-change: auto;
 }
 
 .work-wave-image__frame img {
@@ -1154,6 +1158,16 @@ html.is-about-story-ready .about-story {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  transform-origin: 50% 50%;
+  will-change: auto;
+}
+
+.work-wave-image__frame.is-render-active {
+  will-change: transform, opacity;
+}
+
+.work-wave-image__frame.is-render-active img {
+  will-change: transform;
 }
 
 .capability-cards {
@@ -1214,6 +1228,10 @@ html.is-about-story-ready .about-story {
   -webkit-perspective: 1200px;
   perspective: 1200px;
   transform-origin: center;
+  will-change: auto;
+}
+
+body.capability-cards-active .capability-card {
   will-change: transform, opacity;
 }
 
@@ -1248,6 +1266,12 @@ html.is-about-story-ready .about-story {
   position: absolute;
   inset: 0;
   animation: capability-card-float 2.2s ease-in-out infinite;
+  animation-play-state: paused;
+  will-change: auto;
+}
+
+body.capability-cards-active .capability-card__float {
+  animation-play-state: running;
   will-change: transform;
 }
 
@@ -1263,6 +1287,10 @@ html.is-about-story-ready .about-story {
   position: absolute;
   inset: 0;
   transform-origin: center;
+  will-change: auto;
+}
+
+body.capability-cards-active .capability-card__magnet {
   will-change: transform;
 }
 
@@ -1291,6 +1319,10 @@ html.is-about-story-ready .about-story {
   height: 100%;
   -webkit-transform-style: preserve-3d;
   transform-style: preserve-3d;
+  will-change: auto;
+}
+
+body.capability-cards-active .capability-card__inner {
   will-change: transform;
 }
 
@@ -1360,8 +1392,8 @@ html.is-about-story-ready .about-story {
   border-radius: inherit;
   object-fit: contain;
   object-position: center center;
-  mix-blend-mode: multiply;
-  filter: saturate(1) contrast(1);
+  mix-blend-mode: normal;
+  filter: none;
 }
 
 .capability-card__content {
@@ -3089,10 +3121,6 @@ body .route-transition-snapshot .work-owl-flight-layer {
     font-size: clamp(12px, 3.7vw, 17px);
   }
 
-  .capability-card__float {
-    animation: capability-card-float 2.2s ease-in-out infinite;
-  }
-
   .capability-card__inner {
     transform: rotateY(180deg);
   }
@@ -3281,10 +3309,6 @@ body .route-transition-snapshot .work-owl-flight-layer {
     height: 100dvh !important;
   }
 
-  .intro-page {
-    --intro-scroll-length: 230dvh;
-  }
-
   .about-page {
     height: 100dvh;
     min-height: 100dvh;
@@ -3296,26 +3320,8 @@ body .route-transition-snapshot .work-owl-flight-layer {
     padding-bottom: 0;
   }
 
-  .capability-cards {
-    height: 500dvh;
-  }
-
-  @media (max-width: 760px) {
-    .capability-cards {
-      height: 500dvh;
-    }
-  }
-
   .project-showcase {
     min-height: 100dvh;
-  }
-
-  .work-owl-scene.site-footer {
-    min-height: 190dvh;
-  }
-
-  .intro-frame {
-    height: 100dvh;
   }
 
 }
@@ -3329,11 +3335,11 @@ body .route-transition-snapshot .work-owl-flight-layer {
     --footer-owl-size: min(84vw, 360px);
     --footer-word-gap: clamp(18px, 5.8vw, 34px);
     --footer-edge-padding: 16px;
-    min-height: 172dvh;
+    min-height: 172svh;
   }
 
   .site-footer__stage {
-    min-height: 100dvh;
+    min-height: 100svh;
   }
 
   .site-footer__word {
@@ -3588,7 +3594,11 @@ body .route-transition-snapshot .work-owl-flight-layer {
 
   .work-wave-image__frame {
     transform: none !important;
-    clip-path: inset(0 0 0 0) !important;
+    will-change: auto;
+  }
+
+  .work-wave-image__frame img {
+    transform: none !important;
     will-change: auto;
   }
 
@@ -3622,6 +3632,11 @@ body .route-transition-snapshot .work-owl-flight-layer {
   }
 
   .capability-card__float {
+    animation: none;
+    will-change: auto;
+  }
+
+  body.capability-cards-active .capability-card__float {
     animation: none;
     will-change: auto;
   }
