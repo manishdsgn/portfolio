@@ -26,6 +26,10 @@ const IS_SAFARI_BROWSER =
   navigator.vendor === "Apple Computer, Inc." &&
   /Safari/.test(navigator.userAgent) &&
   !/(CriOS|FxiOS|EdgiOS|OPiOS)/.test(navigator.userAgent);
+const DEV_SCROLL_ENGINE_OVERRIDE = import.meta.env.DEV
+  ? new URLSearchParams(window.location.search).get("scroll-engine")
+  : null;
+const FORCE_NATIVE_SCROLL = DEV_SCROLL_ENGINE_OVERRIDE === "native";
 
 function moveSoundEffectsToLayers(definition, extraEffects = []) {
   const {
@@ -1869,6 +1873,14 @@ let cameraCursorScrambleUpdate = null;
 let cameraCursorLastX = window.innerWidth * 0.5;
 let cameraCursorLastY = window.innerHeight * 0.5;
 let smoothScroller = null;
+let smoothScrollTickerCallback = null;
+let smoothScrollReconcileFrame = 0;
+let smoothScrollLockObserver = null;
+let lastObservedScrollLockState = null;
+let nativeScrollTrackingActive = false;
+let scrollEngineMode = "native";
+let lenisInputWatchdogTimer = 0;
+let lenisRecoveryAttempts = 0;
 let workScrollVelocity = 0;
 let workScrollFast = false;
 let workScrollSettleTimer = 0;
@@ -2101,10 +2113,7 @@ function releaseHeroScrollGate() {
   root.classList.remove("is-camera-intro-locked");
   if (!wasLocked) return;
   resetRouteScrollToTop();
-
-  if (shouldResumeSmoothScroll()) {
-    smoothScroller?.start?.();
-  }
+  reconcileSmoothScrollAfterLockChange();
 }
 
 function maybeReleaseHeroScrollGate() {
@@ -2122,7 +2131,7 @@ function beginHeroScrollGate() {
   heroTextRevealComplete = false;
   document.documentElement.classList.add("is-camera-intro-locked");
   resetRouteScrollToTop();
-  smoothScroller?.stop?.();
+  reconcileSmoothScrollAfterLockChange();
   // A text-animation callback must never be the only way to restore page
   // input. WebKit may suspend timers/tickers during power or tab transitions.
   heroScrollGateFailsafeTimer = window.setTimeout(() => {
@@ -2562,7 +2571,7 @@ function playStartupGlyphTransition(onRevealStart = null) {
   pageTransitionTimeline = null;
   pageTransitionActive = true;
   document.documentElement.classList.add("is-startup-transitioning");
-  smoothScroller?.stop?.();
+  reconcileSmoothScrollAfterLockChange();
   pageTransitionRoot.classList.add("is-active");
   pageTransitionRoot.classList.remove("is-covered");
   pageTransitionRoot.setAttribute("aria-hidden", "false");
@@ -2583,6 +2592,7 @@ function playStartupGlyphTransition(onRevealStart = null) {
       pageTransitionTimeline = null;
       pageTransitionActive = false;
       document.documentElement.classList.remove("is-startup-transitioning");
+      reconcileSmoothScrollAfterLockChange();
       pageTransitionRoot.classList.remove("is-active");
       pageTransitionRoot.classList.remove("is-covered");
       pageTransitionRoot.setAttribute("aria-hidden", "true");
@@ -3178,11 +3188,7 @@ function finishPageTransition() {
     ensureWorkReturnHeroReveal();
   }
 
-  if (shouldResumeSmoothScroll()) {
-    smoothScroller?.start?.();
-  } else {
-    smoothScroller?.stop?.();
-  }
+  reconcileSmoothScrollAfterLockChange({ resize: true });
 
   playActiveRouteReveal();
 }
@@ -3208,7 +3214,7 @@ function scrollWorkRouteToHero() {
   }
 
   if (smoothScroller) {
-    smoothScroller.start?.();
+    reconcileSmoothScrollAfterLockChange();
     smoothScroller.scrollTo(0, {
       duration: 1.25,
       easing: (progress) => 1 - Math.pow(1 - progress, 4),
@@ -3375,9 +3381,7 @@ function playAboutStoryReveal() {
   aboutStoryObserver = null;
   document.documentElement.classList.add("is-about-story-ready");
   aboutStory.setAttribute("aria-hidden", "false");
-  if (shouldResumeSmoothScroll()) {
-    smoothScroller?.start?.();
-  }
+  reconcileSmoothScrollAfterLockChange({ resize: true });
 
   if (aboutStoryItems.length === 0) {
     smoothScroller?.resize?.();
@@ -3615,11 +3619,7 @@ function setCurrentPage(targetId, shouldRefresh = true) {
 
   resetRouteScrollToTop();
 
-  if (shouldResumeSmoothScroll()) {
-    smoothScroller?.start?.();
-  } else {
-    smoothScroller?.stop?.();
-  }
+  reconcileSmoothScrollAfterLockChange({ resize: true });
 
   if (targetId === "work") {
     resetAboutQuoteReveal();
@@ -3693,7 +3693,7 @@ function navigateToSection(targetId) {
   captureCurrentRouteTransitionSnapshot();
   pageTransitionActive = true;
   document.documentElement.classList.add("is-page-transitioning");
-  smoothScroller?.stop?.();
+  reconcileSmoothScrollAfterLockChange();
   pageTransitionRoot.classList.add("is-active");
   pageTransitionRoot.classList.remove("is-covered");
   pageTransitionRoot.setAttribute("aria-hidden", "false");
@@ -7330,12 +7330,144 @@ function settleIntroTyperRecords(records, immediate = false) {
 }
 
 function shouldResumeSmoothScroll() {
+  const root = document.documentElement;
+
   return (
-    !document.documentElement.classList.contains("is-camera-intro-locked") &&
-    !document.documentElement.classList.contains("is-case-study-open") &&
-    !document.documentElement.classList.contains("is-case-study-transitioning") &&
-    !document.documentElement.classList.contains("is-page-transitioning")
+    !document.body.classList.contains("is-startup-loading") &&
+    !root.classList.contains("is-startup-transitioning") &&
+    !root.classList.contains("is-camera-intro-locked") &&
+    !root.classList.contains("is-intro-reveal-locked") &&
+    !root.classList.contains("is-case-study-open") &&
+    !root.classList.contains("is-case-study-transitioning") &&
+    !root.classList.contains("is-page-transitioning")
   );
+}
+
+function reconcileSmoothScrollAfterLockChange({ resize = false } = {}) {
+  if (smoothScrollReconcileFrame !== 0) {
+    window.cancelAnimationFrame(smoothScrollReconcileFrame);
+  }
+
+  smoothScrollReconcileFrame = window.requestAnimationFrame(() => {
+    smoothScrollReconcileFrame = 0;
+    if (!smoothScroller) return;
+
+    if (resize) {
+      smoothScroller.resize?.();
+    }
+
+    const isLocked = !shouldResumeSmoothScroll();
+    const autoToggleEnabled = smoothScroller.options?.autoToggle === true;
+
+    // Modern Safari observes CSS overflow through Lenis autoToggle. Older
+    // engines keep the same centralized behaviour through this fallback.
+    if (!autoToggleEnabled) {
+      if (isLocked) {
+        smoothScroller.stop?.();
+      } else {
+        smoothScroller.start?.();
+      }
+      return;
+    }
+
+    // A delayed WebKit transition event must never leave Lenis stopped once
+    // every authored CSS lock has been removed.
+    if (!isLocked && smoothScroller.isStopped) {
+      smoothScroller.start?.();
+    }
+  });
+}
+
+function setupNativeScrollTracking() {
+  if (nativeScrollTrackingActive) return;
+
+  nativeScrollTrackingActive = true;
+  let previousScrollY = window.scrollY;
+  window.addEventListener("scroll", () => {
+    if (scrollEngineMode !== "native") {
+      previousScrollY = window.scrollY;
+      return;
+    }
+
+    const nextScrollY = window.scrollY;
+    const velocity = nextScrollY - previousScrollY;
+    previousScrollY = nextScrollY;
+    updateVisibleScrollTriggers({ velocity });
+  }, { passive: true });
+}
+
+function activateNativeScrollFallback(reason = "runtime-recovery") {
+  if (scrollEngineMode === "native") return;
+
+  const currentScrollY = window.scrollY;
+  window.clearTimeout(lenisInputWatchdogTimer);
+  lenisInputWatchdogTimer = 0;
+
+  if (smoothScrollTickerCallback !== null) {
+    gsap.ticker.remove(smoothScrollTickerCallback);
+    smoothScrollTickerCallback = null;
+  }
+
+  smoothScrollLockObserver?.disconnect();
+  smoothScrollLockObserver = null;
+  smoothScroller?.destroy?.();
+  smoothScroller = null;
+  scrollEngineMode = "native";
+  gsap.ticker.lagSmoothing(500, 33);
+  setupNativeScrollTracking();
+  window.scrollTo(0, currentScrollY);
+  ScrollTrigger.update();
+
+  console.warn(`Lenis switched to native scrolling for this session: ${reason}.`);
+}
+
+function armLenisInputWatchdog(event) {
+  if (
+    scrollEngineMode !== "lenis" ||
+    !smoothScroller ||
+    !shouldResumeSmoothScroll() ||
+    !Number.isFinite(event.deltaY) ||
+    Math.abs(event.deltaY) < 1
+  ) {
+    return;
+  }
+
+  const startScrollY = window.scrollY;
+  const maxScrollY = Math.max(
+    0,
+    document.documentElement.scrollHeight - window.innerHeight,
+  );
+  const pointsPastBoundary =
+    (event.deltaY < 0 && startScrollY <= 1) ||
+    (event.deltaY > 0 && startScrollY >= maxScrollY - 1);
+  if (pointsPastBoundary) return;
+
+  if (smoothScroller.isStopped) {
+    smoothScroller.start?.();
+  }
+
+  window.clearTimeout(lenisInputWatchdogTimer);
+  lenisInputWatchdogTimer = window.setTimeout(() => {
+    lenisInputWatchdogTimer = 0;
+    if (
+      scrollEngineMode !== "lenis" ||
+      !smoothScroller ||
+      !shouldResumeSmoothScroll() ||
+      Math.abs(window.scrollY - startScrollY) >= 0.5
+    ) {
+      lenisRecoveryAttempts = 0;
+      return;
+    }
+
+    if (lenisRecoveryAttempts === 0) {
+      lenisRecoveryAttempts = 1;
+      smoothScroller.resize?.();
+      smoothScroller.start?.();
+      return;
+    }
+
+    activateNativeScrollFallback("unresponsive-wheel-input");
+  }, 420);
 }
 
 function getIntroRevealStartScrollY() {
@@ -7375,7 +7507,7 @@ function lockIntroRevealScroll() {
   introRevealOwlComplete = false;
   pinScrollToIntroRevealStart();
   document.documentElement.classList.add("is-intro-reveal-locked");
-  smoothScroller?.stop?.();
+  reconcileSmoothScrollAfterLockChange();
 }
 
 function unlockIntroRevealScroll() {
@@ -7393,10 +7525,7 @@ function unlockIntroRevealScroll() {
   if (!wasLocked) return;
 
   settleSmoothScrollAtCurrentPosition();
-
-  if (shouldResumeSmoothScroll()) {
-    smoothScroller?.start?.();
-  }
+  reconcileSmoothScrollAfterLockChange();
 }
 
 function clearIntroRevealTimers() {
@@ -9080,43 +9209,73 @@ function setupIntroOwlScramble() {
 function setupSmoothScroll() {
   ScrollTrigger.config({ ignoreMobileResize: true });
 
-  if (IS_SAFARI_BROWSER) {
-    // Native WebKit scrolling is already threaded. More importantly, keeping
-    // a stopped Lenis instance here applies `.lenis-stopped { overflow: clip }`
-    // and can freeze every route if any reveal callback is delayed. Safari
-    // uses native scroll as its sole authority; CSS classes own brief locks.
-    let previousScrollY = window.scrollY;
-    window.addEventListener("scroll", () => {
-      const nextScrollY = window.scrollY;
-      const velocity = nextScrollY - previousScrollY;
-      previousScrollY = nextScrollY;
-      updateVisibleScrollTriggers({ velocity });
-    }, { passive: true });
-
-    smoothScroller = null;
+  if (FORCE_NATIVE_SCROLL) {
+    scrollEngineMode = "native";
+    setupNativeScrollTracking();
     gsap.ticker.lagSmoothing(500, 33);
     return;
   }
 
+  const supportsAutoToggle =
+    typeof CSS !== "undefined" &&
+    CSS.supports?.("transition-behavior", "allow-discrete") === true;
   const lenis = new Lenis({
-    autoRaf: true,
+    autoRaf: false,
+    autoToggle: supportsAutoToggle,
     wheelMultiplier: 1,
     touchMultiplier: 1,
     touchInertiaExponent: 1.7,
     syncTouchLerp: 0.075,
     lerp: 0.18,
     smoothWheel: true,
-    // Lenis remains the single scroll owner on non-Safari touch browsers.
-    syncTouch: true,
+    // Mac trackpads arrive as wheel input and remain fully smoothed. Keeping
+    // WebKit touch momentum native avoids a second inertia model on iOS while
+    // Lenis still owns scroll synchronization and programmatic scrolls.
+    syncTouch: !IS_SAFARI_BROWSER,
+    stopInertiaOnNavigate: true,
   });
 
   smoothScroller = lenis;
+  scrollEngineMode = "lenis";
   lenis.on("scroll", updateVisibleScrollTriggers);
+  smoothScrollTickerCallback = (time) => {
+    lenis.raf(time * 1000);
+  };
+  // Prioritize scroll interpolation before canvas and decorative callbacks so
+  // ScrollTrigger reads the current Lenis position on the same frame.
+  gsap.ticker.add(smoothScrollTickerCallback, false, true);
+  gsap.ticker.lagSmoothing(0);
 
-  // Lenis owns its native rAF while GSAP retains lag protection for the
-  // time-based decorative timelines. Coupling both to one ticker made a
-  // heavy canvas frame stall scrolling, audio fades, and footer sequencing.
-  gsap.ticker.lagSmoothing(500, 33);
+  window.addEventListener("wheel", armLenisInputWatchdog, { passive: true });
+  smoothScrollLockObserver?.disconnect();
+  lastObservedScrollLockState = !shouldResumeSmoothScroll();
+  smoothScrollLockObserver = new MutationObserver(() => {
+    const nextLockState = !shouldResumeSmoothScroll();
+    if (nextLockState === lastObservedScrollLockState) return;
+    lastObservedScrollLockState = nextLockState;
+    reconcileSmoothScrollAfterLockChange();
+  });
+  smoothScrollLockObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ["class"],
+  });
+  smoothScrollLockObserver.observe(document.body, {
+    attributes: true,
+    attributeFilter: ["class"],
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden || scrollEngineMode !== "lenis") return;
+    lenisRecoveryAttempts = 0;
+    lenis.resize();
+    lenis.scrollTo(window.scrollY, {
+      immediate: true,
+      force: true,
+    });
+    reconcileSmoothScrollAfterLockChange();
+    ScrollTrigger.update();
+  });
+
+  reconcileSmoothScrollAfterLockChange({ resize: true });
 }
 
 function setupScroll() {
@@ -14889,9 +15048,7 @@ function scrollToCaseStudySection(sectionId) {
 }
 
 function resumeSmoothScrollAfterCaseStudy() {
-  if (shouldResumeSmoothScroll()) {
-    smoothScroller?.start?.();
-  }
+  reconcileSmoothScrollAfterLockChange({ resize: true });
 }
 
 function resetCaseStudyLayer() {
@@ -14906,6 +15063,7 @@ function resetCaseStudyLayer() {
     "is-case-study-open",
     "is-case-study-transitioning",
   );
+  reconcileSmoothScrollAfterLockChange({ resize: true });
   gsap.set(caseStudyLayer, { clearProps: "backgroundColor" });
   gsap.set(caseStudyPage, { clearProps: "visibility,transform" });
   gsap.set(caseStudyCloseButton, { clearProps: "visibility" });
@@ -14960,6 +15118,7 @@ function closeProjectCaseStudy(immediate = false, onComplete = null) {
   caseStudyPage.classList.remove("is-open");
   document.documentElement.classList.remove("is-case-study-open");
   document.documentElement.classList.add("is-case-study-transitioning");
+  reconcileSmoothScrollAfterLockChange();
 
   gsap.to(caseStudyPage, {
     xPercent: 104,
@@ -15008,7 +15167,7 @@ function openProjectCaseStudy(projectFileButton) {
   caseStudyLayer.setAttribute("aria-hidden", "false");
   caseStudyPage.classList.remove("is-open");
   document.documentElement.classList.add("is-case-study-transitioning");
-  smoothScroller?.stop?.();
+  reconcileSmoothScrollAfterLockChange();
   gsap.set(caseStudyPage, { visibility: "hidden", xPercent: 0 });
   prepareCaseStudyReveal();
 
@@ -15022,6 +15181,7 @@ function openProjectCaseStudy(projectFileButton) {
     });
     document.documentElement.classList.remove("is-case-study-transitioning");
     document.documentElement.classList.add("is-case-study-open");
+    reconcileSmoothScrollAfterLockChange();
     activateCaseStudyExperience();
     return;
   }
@@ -15078,6 +15238,7 @@ function openProjectCaseStudy(projectFileButton) {
       gsap.set(caseStudyLayer, { backgroundColor: BACKGROUND_COLOR });
       document.documentElement.classList.remove("is-case-study-transitioning");
       document.documentElement.classList.add("is-case-study-open");
+      reconcileSmoothScrollAfterLockChange();
       activateCaseStudyExperience();
     },
   });
