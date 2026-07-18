@@ -1614,6 +1614,7 @@ let workFooterScenePrewarmHandle = null;
 let workOwlScenePresenceScrollTrigger = null;
 let workOwlSceneEnterTween = null;
 let footerInteractionTimeline = null;
+let footerInteractionCompletionFallback = null;
 let footerInteractionState = "idle";
 let aboutQuoteTimeline = null;
 let aboutStoryObserver = null;
@@ -10154,6 +10155,11 @@ function setFooterInteractionState(nextState) {
   }
 }
 
+function clearFooterInteractionCompletionFallback() {
+  footerInteractionCompletionFallback?.kill();
+  footerInteractionCompletionFallback = null;
+}
+
 function isFooterInteractionStartBlocked() {
   const root = document.documentElement;
 
@@ -10173,6 +10179,7 @@ function isFooterSceneVisible() {
 }
 
 function setFooterInteractionFinal() {
+  clearFooterInteractionCompletionFallback();
   footerInteractionTimeline?.kill();
   footerInteractionTimeline = null;
   setFooterInteractionState("complete");
@@ -10263,10 +10270,7 @@ function buildFooterInteractionTimeline() {
       workOwlSceneHasLanded = false;
     },
     onComplete() {
-      footerInteractionTimeline = null;
-      setFooterInteractionState("complete");
-      showFooterOwlFinal();
-      showFooterFinalGlow({ immediate: true });
+      setFooterInteractionFinal();
     },
   });
 
@@ -10445,10 +10449,29 @@ function playFooterInteraction() {
   footerInteractionTimeline = buildFooterInteractionTimeline();
   setFooterInteractionState("playing");
   footerInteractionTimeline?.play(0);
+
+  clearFooterInteractionCompletionFallback();
+  const expectedDuration = footerInteractionTimeline?.duration() ?? 0;
+  if (expectedDuration > 0) {
+    footerInteractionCompletionFallback = gsap.delayedCall(
+      expectedDuration + 0.35,
+      () => {
+        footerInteractionCompletionFallback = null;
+        if (
+          document.body.dataset.currentPage === "work" &&
+          footerInteractionState === "playing" &&
+          isFooterSceneVisible()
+        ) {
+          setFooterInteractionFinal();
+        }
+      },
+    );
+  }
 }
 
 function resetFooterInteraction() {
   stopFooterAmbientOutro();
+  clearFooterInteractionCompletionFallback();
   footerInteractionTimeline?.kill();
   footerInteractionTimeline = null;
   setFooterInteractionState("idle");
@@ -11514,7 +11537,10 @@ function setupWorkOwlScene() {
 
   workOwlScenePresenceScrollTrigger = ScrollTrigger.create({
     trigger: workOwlScene,
-    start: "top top",
+    // Begin as the sticky footer enters the viewport. The first half of the
+    // sequence can pre-roll while the stage rises into view, so even a fast
+    // Safari scroll does not arrive at an intentionally empty opening frame.
+    start: "top bottom",
     end: "bottom bottom",
     invalidateOnRefresh: true,
     onEnter: playFooterInteraction,
@@ -12556,6 +12582,13 @@ function setupCapabilityCards() {
 
       let previousCardsProgress = 0;
       let glyphBurstArmed = true;
+      let cardHeights = capabilityCards.map((card) => card.offsetHeight);
+      let cardsViewportHeight = window.innerHeight;
+
+      const refreshCardMetrics = () => {
+        cardsViewportHeight = window.innerHeight;
+        cardHeights = capabilityCards.map((card) => card.offsetHeight);
+      };
 
       const updateCards = (progress) => {
         if (progress <= CAPABILITY_GLYPH_BURST_TRIGGER_PROGRESS - 0.055) {
@@ -12590,15 +12623,16 @@ function setupCapabilityCards() {
 
           let y = 0;
           let scale = 1;
+          const cardHeight = cardHeights[index] ?? 0;
           const offscreenY = -(
-            window.innerHeight * 0.5 +
-            card.offsetHeight * 0.125 +
+            cardsViewportHeight * 0.5 +
+            cardHeight * 0.125 +
             4
           );
 
           if (cardProgress < 0.4) {
             const arrivalProgress = smoothstep(0, 1, cardProgress / 0.4);
-            y = lerp(offscreenY, card.offsetHeight * 0.5, arrivalProgress);
+            y = lerp(offscreenY, cardHeight * 0.5, arrivalProgress);
             scale = lerp(0.25, 0.75, arrivalProgress);
           } else if (cardProgress < 0.6) {
             const settleProgress = smoothstep(
@@ -12606,7 +12640,7 @@ function setupCapabilityCards() {
               1,
               (cardProgress - 0.4) / 0.2,
             );
-            y = lerp(card.offsetHeight * 0.5, 0, settleProgress);
+            y = lerp(cardHeight * 0.5, 0, settleProgress);
             scale = lerp(0.75, 1, settleProgress);
           }
 
@@ -12659,10 +12693,16 @@ function setupCapabilityCards() {
         trigger: capabilityCardsSection,
         start: "top top",
         end: "bottom bottom",
-        scrub: 1,
+        // Lenis already smooths the scroll. A second one-second scrub can
+        // leave the cards catching up after Safari has moved the sticky stage
+        // out of view, so bind this choreography directly to scroll progress.
+        scrub: true,
         invalidateOnRefresh: true,
         onUpdate: (self) => updateCards(self.progress),
-        onRefresh: (self) => updateCards(self.progress),
+        onRefresh: (self) => {
+          refreshCardMetrics();
+          updateCards(self.progress);
+        },
       });
 
       return cleanupCapabilityCards;

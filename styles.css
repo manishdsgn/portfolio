@@ -1211,6 +1211,7 @@ html.is-about-story-ready .about-story {
   max-width: 300px;
   aspect-ratio: 5 / 7;
   opacity: 1;
+  -webkit-perspective: 1200px;
   perspective: 1200px;
   transform-origin: center;
   will-change: transform, opacity;
@@ -1288,6 +1289,7 @@ html.is-about-story-ready .about-story {
   position: relative;
   width: 100%;
   height: 100%;
+  -webkit-transform-style: preserve-3d;
   transform-style: preserve-3d;
   will-change: transform;
 }
@@ -1309,6 +1311,7 @@ html.is-about-story-ready .about-story {
 .capability-card__face--front {
   padding: 0;
   color: #071c58;
+  transform: translateZ(0.1px);
 }
 
 .capability-card__face--front img {
@@ -1330,7 +1333,7 @@ html.is-about-story-ready .about-story {
     0 22px 34px -30px rgba(7, 28, 88, 0.24),
     0 8px 16px -16px rgba(7, 28, 88, 0.16),
     inset 0 -34px 40px -60px rgba(7, 28, 88, 0.18);
-  transform: rotateY(180deg);
+  transform: rotateY(180deg) translateZ(0.1px);
 }
 
 .capability-card__cover {
