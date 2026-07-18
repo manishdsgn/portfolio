@@ -164,6 +164,8 @@ let pendingClickStatePop = false;
 let pendingGlyphSplash = false;
 let glyphSplashSampleReady = false;
 let glyphSplashSampleLoadPromise = null;
+let glyphSplashVoice = null;
+let glyphSplashVoiceCleanupTimer = 0;
 let cameraAmbientArmed = false;
 let cameraAmbientPlayPending = false;
 let footerAmbientPlayPending = false;
@@ -381,11 +383,27 @@ function playClickStatePop() {
   playMinimalPopSound();
 }
 
+function playSingleGlyphSplashVoice() {
+  window.clearTimeout(glyphSplashVoiceCleanupTimer);
+  glyphSplashVoiceCleanupTimer = 0;
+  glyphSplashVoice?.stop(0.025);
+
+  const voice = playGlyphSplashSound({ volume: GLYPH_SPLASH_VOLUME });
+  glyphSplashVoice = voice ?? null;
+
+  if (glyphSplashVoice === null) return;
+
+  glyphSplashVoiceCleanupTimer = window.setTimeout(() => {
+    if (glyphSplashVoice === voice) glyphSplashVoice = null;
+    glyphSplashVoiceCleanupTimer = 0;
+  }, 1100);
+}
+
 function primeGlyphSplashSample() {
   if (glyphSplashSampleReady) {
     if (pendingGlyphSplash && isProjectAudioRunning()) {
       pendingGlyphSplash = false;
-      playGlyphSplashSound({ volume: GLYPH_SPLASH_VOLUME });
+      playSingleGlyphSplashVoice();
     }
     return Promise.resolve();
   }
@@ -405,7 +423,7 @@ function primeGlyphSplashSample() {
 
     if (pendingGlyphSplash && isProjectAudioRunning()) {
       pendingGlyphSplash = false;
-      playGlyphSplashSound({ volume: GLYPH_SPLASH_VOLUME });
+      playSingleGlyphSplashVoice();
     }
 
     return Promise.resolve();
@@ -427,7 +445,7 @@ function primeGlyphSplashSample() {
 
       if (pendingGlyphSplash && isProjectAudioRunning()) {
         pendingGlyphSplash = false;
-        playGlyphSplashSound({ volume: GLYPH_SPLASH_VOLUME });
+        playSingleGlyphSplashVoice();
       }
     })
     .catch((error) => {
@@ -447,7 +465,7 @@ function playGlyphSplash() {
     return;
   }
 
-  playGlyphSplashSound({ volume: GLYPH_SPLASH_VOLUME });
+  playSingleGlyphSplashVoice();
 }
 
 function playFooterOrganGlyphSplash() {
@@ -1078,7 +1096,7 @@ const CAMERA_MOBILE_SCALE_BOOST = 1.02;
 const CAPABILITY_OWL_READY_PROGRESS = 0.74;
 const CAPABILITY_GLYPH_BURST_TRIGGER_PROGRESS = 0.585;
 const CAPABILITY_GLYPH_BURST_DURATION = 0.76;
-const CAPABILITY_GLYPH_BURST_MAX_DPR = 1.5;
+const CAPABILITY_GLYPH_BURST_MAX_DPR = IS_SAFARI_BROWSER ? 1 : 1.5;
 const FOOTER_GLYPH_BURST_MAX_DPR = 1;
 const CAPABILITY_GLYPH_BURST_CELL_SIZE = 16;
 const CAPABILITY_GLYPH_BURST_FRONT_FEATHER_CELLS = 2.8;
@@ -1884,6 +1902,9 @@ let lenisRecoveryAttempts = 0;
 let workScrollVelocity = 0;
 let workScrollFast = false;
 let workScrollSettleTimer = 0;
+let criticalSceneSyncFrame = 0;
+let syncCapabilityCardsFromScroll = null;
+let syncFooterFromScroll = null;
 let cameraLastRenderTime = Number.NEGATIVE_INFINITY;
 let cameraScrollTrigger = null;
 let cameraTemporalCanvas = null;
@@ -3244,11 +3265,25 @@ function updateVisibleScrollTriggers(scrollState = null) {
       requestCameraRender();
       syncWorkWaveGalleryToScroll();
       ScrollTrigger.update();
+      scheduleCriticalSceneSync();
       window.dispatchEvent(new CustomEvent("workScrollSettled"));
     }, 120);
   }
 
   ScrollTrigger.update();
+  scheduleCriticalSceneSync();
+}
+
+function scheduleCriticalSceneSync() {
+  if (criticalSceneSyncFrame !== 0) return;
+
+  criticalSceneSyncFrame = window.requestAnimationFrame(() => {
+    criticalSceneSyncFrame = 0;
+    if (activePageId !== "work") return;
+
+    syncCapabilityCardsFromScroll?.();
+    syncFooterFromScroll?.();
+  });
 }
 
 function suspendWorkRouteScene() {
@@ -10895,6 +10930,13 @@ function buildFooterInteractionTimeline() {
       // the fast-scroll race where the transform tween runs while the owl's
       // internal frames remain paused.
       setWorkOwlSceneActive(true, true);
+      renderWorkOwlInitialFrameIfNeeded();
+      if (workOwlLayer instanceof HTMLElement) {
+        // Establish visibility before the delayed entrance tween. If WebKit
+        // misses the exact label frame, the owl still interpolates from its
+        // parked transform instead of flashing in at the destination.
+        workOwlLayer.dataset.workOwlVisible = "true";
+      }
       setFooterInteractionState("playing");
       workOwlSceneHasEntered = true;
       workOwlSceneHasLanded = false;
@@ -11036,9 +11078,9 @@ function playFooterInteraction() {
 
   // A fast wheel gesture can momentarily cross this trigger while the intro
   // lock is pinning the page back to its reveal. Starting in that transient
-  // frame makes the footer finish off-screen, so only an unlocked, visible
-  // first arrival is allowed to create the timeline.
-  if (isFooterInteractionStartBlocked() || !isFooterSceneVisible()) return;
+  // frame makes the footer finish off-screen, so only an unlocked first
+  // arrival is allowed to create the timeline.
+  if (isFooterInteractionStartBlocked()) return;
 
   if (!isIntroOwlDataReady()) {
     if (!workOwlSceneEnterPending) {
@@ -11089,8 +11131,7 @@ function playFooterInteraction() {
         footerInteractionCompletionFallback = null;
         if (
           document.body.dataset.currentPage === "work" &&
-          footerInteractionState === "playing" &&
-          isFooterSceneVisible()
+          footerInteractionState === "playing"
         ) {
           setFooterInteractionFinal();
         }
@@ -12163,6 +12204,7 @@ function setupWorkOwlScene() {
   workOwlSceneHasLanded = false;
   workOwlSceneProgress = 0;
   workOwlSceneEnterPending = false;
+  syncFooterFromScroll = null;
   setWorkOwlSceneLanded(false);
   setupFooterCopyEmail();
 
@@ -12184,12 +12226,12 @@ function setupWorkOwlScene() {
   resetFooterInteraction();
 
   const reconcileFooterInteraction = () => {
-    if (
-      document.body.dataset.currentPage !== "work" ||
-      !isFooterSceneVisible()
-    ) {
-      return;
-    }
+    if (document.body.dataset.currentPage !== "work") return;
+
+    const bounds = workOwlScene.getBoundingClientRect();
+    const hasReachedFooter =
+      bounds.top <= window.innerHeight * 0.9 && bounds.bottom > 0;
+    if (!hasReachedFooter) return;
 
     if (footerInteractionState === "complete") {
       setWorkOwlSceneActive(true, true);
@@ -12202,12 +12244,13 @@ function setupWorkOwlScene() {
     playFooterInteraction();
   };
 
+  syncFooterFromScroll = reconcileFooterInteraction;
+
   workOwlScenePresenceScrollTrigger = ScrollTrigger.create({
     trigger: workOwlScene,
-    // Begin only once the sticky stage's centre is actually in view. Starting
-    // at `top bottom` made the owl complete its entrance below the viewport,
-    // so users saw only the settled frame when they reached the footer.
-    start: "top 20%",
+    // Start as the sticky stage enters. The sequence remains time-based, but
+    // it no longer waits until most of the first footer viewport has passed.
+    start: "top 86%",
     end: "bottom bottom",
     invalidateOnRefresh: true,
     onEnter: reconcileFooterInteraction,
@@ -12988,6 +13031,7 @@ function setupCapabilityCards() {
 
   capabilityCardsMatchMedia?.revert();
   capabilityCardsMatchMedia = gsap.matchMedia();
+  syncCapabilityCardsFromScroll = null;
 
   const highlightRevealStates = capabilityCardKeywords.map(() => false);
   const blueRunnerStates = capabilityCardKeywords.map(() => ({
@@ -12998,12 +13042,6 @@ function setupCapabilityCards() {
     revealTweens: [],
   }));
   const runnerIndexes = [0, 1];
-  let capabilityGlyphBurstRetry = null;
-
-  const cancelCapabilityGlyphBurstRetry = () => {
-    capabilityGlyphBurstRetry?.kill?.();
-    capabilityGlyphBurstRetry = null;
-  };
 
   const killBlueRunnerState = (cardIndex) => {
     const state = blueRunnerStates[cardIndex];
@@ -13027,7 +13065,6 @@ function setupCapabilityCards() {
   };
 
   const cleanupCapabilityCards = () => {
-    cancelCapabilityGlyphBurstRetry();
     document.body.classList.remove("capability-cards-active");
     cleanupBlueRunners();
     stopCapabilityGlyphBurst();
@@ -13369,7 +13406,6 @@ function setupCapabilityCards() {
       let cardsViewportHeight = window.innerHeight;
 
       const attemptCapabilityGlyphBurst = () => {
-        cancelCapabilityGlyphBurstRetry();
         if (!glyphBurstPending || !glyphBurstArmed) return;
 
         const sectionBounds = capabilityCardsSection.getBoundingClientRect();
@@ -13381,23 +13417,10 @@ function setupCapabilityCards() {
           return;
         }
 
-        if (workScrollFast) {
-          capabilityGlyphBurstRetry = gsap.delayedCall(
-            0.14,
-            attemptCapabilityGlyphBurst,
-          );
-          return;
-        }
-
         glyphBurstPending = false;
         glyphBurstArmed = false;
         playCapabilityGlyphBurst();
       };
-
-      const handleWorkScrollSettled = () => {
-        if (glyphBurstPending) attemptCapabilityGlyphBurst();
-      };
-      window.addEventListener("workScrollSettled", handleWorkScrollSettled);
 
       const refreshCardMetrics = () => {
         cardsViewportHeight = window.innerHeight;
@@ -13408,7 +13431,6 @@ function setupCapabilityCards() {
         if (progress <= CAPABILITY_GLYPH_BURST_TRIGGER_PROGRESS - 0.055) {
           glyphBurstArmed = true;
           glyphBurstPending = false;
-          cancelCapabilityGlyphBurstRetry();
         } else if (
           glyphBurstArmed &&
           previousCardsProgress < CAPABILITY_GLYPH_BURST_TRIGGER_PROGRESS &&
@@ -13505,7 +13527,7 @@ function setupCapabilityCards() {
       setAllKeywordHighlightsHidden();
       updateCards(0);
 
-      ScrollTrigger.create({
+      const cardsScrollTrigger = ScrollTrigger.create({
         trigger: capabilityCardsSection,
         start: "top top",
         end: "bottom bottom",
@@ -13535,7 +13557,6 @@ function setupCapabilityCards() {
         onLeaveBack: () => {
           updateCards(0);
           glyphBurstPending = false;
-          cancelCapabilityGlyphBurstRetry();
           document.body.classList.remove("capability-cards-active");
           cleanupBlueRunners();
           stopCapabilityGlyphBurst();
@@ -13552,15 +13573,26 @@ function setupCapabilityCards() {
             const bounds = capabilityCardsSection.getBoundingClientRect();
             if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) {
               glyphBurstPending = false;
-              cancelCapabilityGlyphBurstRetry();
               stopCapabilityGlyphBurst();
             }
           }
         },
       });
 
+      const syncCards = () => {
+        updateCards(cardsScrollTrigger.progress);
+        document.body.classList.toggle(
+          "capability-cards-active",
+          cardsScrollTrigger.isActive,
+        );
+      };
+      syncCapabilityCardsFromScroll = syncCards;
+      syncCards();
+
       return () => {
-        window.removeEventListener("workScrollSettled", handleWorkScrollSettled);
+        if (syncCapabilityCardsFromScroll === syncCards) {
+          syncCapabilityCardsFromScroll = null;
+        }
         cleanupCapabilityCards();
       };
     },
@@ -15419,6 +15451,7 @@ function warmCapabilityCardAssets() {
   capabilityCardAssetWarmupPromise = (async () => {
     capabilityCardImages.forEach((image) => {
       image.loading = "eager";
+      image.fetchPriority = "high";
     });
     await decodeImageAssets(capabilityCardImages, 2);
   })();
@@ -15434,6 +15467,7 @@ function warmWorkWaveAssets() {
   workWaveAssetWarmupPromise = (async () => {
     workWaveImages.forEach((image) => {
       image.loading = "eager";
+      image.fetchPriority = "auto";
     });
     await decodeImageAssets(workWaveImages, 2);
   })();
@@ -15792,6 +15826,7 @@ function scheduleViewportResize() {
       if (activePageId === "work") {
         ScrollTrigger.refresh();
         syncWorkWaveGalleryToScroll();
+        scheduleCriticalSceneSync();
       }
     });
   }, 120);
@@ -15865,7 +15900,7 @@ async function boot() {
   const capabilityAssetsReady = warmCapabilityCardAssets().catch((error) => {
     console.error("Unable to warm the capability card assets.", error);
   });
-  warmWorkWaveAssets().catch((error) => {
+  const galleryAssetsReady = warmWorkWaveAssets().catch((error) => {
     console.error("Unable to warm the gallery assets.", error);
   });
   const canvasEffectsReady = Promise.all([
@@ -15884,6 +15919,12 @@ async function boot() {
   ScrollTrigger.update();
   await startupEntryChoice;
   await introOwlPreload;
+  // A cold Safari visit must not discover and decode the card/gallery
+  // textures only after their ScrollTriggers have already been crossed.
+  await settleWithTimeout(
+    Promise.all([capabilityAssetsReady, galleryAssetsReady]),
+    3200,
+  );
   await settleWithTimeout(canvasEffectsReady, 1600);
   resetIntroTyperReveal();
   resetRouteScrollToTop();
@@ -15902,6 +15943,7 @@ async function boot() {
   smoothScroller?.resize?.();
   ScrollTrigger.refresh();
   syncWorkWaveGalleryToScroll();
+  scheduleCriticalSceneSync();
 }
 
 function recoverDocumentAfterInterruptedBoot(error = null) {
@@ -15932,6 +15974,7 @@ function recoverDocumentAfterInterruptedBoot(error = null) {
   window.requestAnimationFrame(() => {
     ScrollTrigger.refresh();
     ScrollTrigger.update();
+    scheduleCriticalSceneSync();
   });
 }
 
