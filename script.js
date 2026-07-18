@@ -1957,6 +1957,7 @@ let workFooterScenePrewarmHandle = null;
 let workOwlScenePresenceScrollTrigger = null;
 let workOwlSceneEnterTween = null;
 let footerInteractionTimeline = null;
+let footerInteractionTimelinePrepared = false;
 let footerInteractionCompletionFallback = null;
 let footerInteractionState = "idle";
 let aboutQuoteTimeline = null;
@@ -10572,14 +10573,14 @@ function playFooterGlyphBurst() {
   const origin = getFooterGlyphBurstOrigin();
   if (origin === null) return;
 
-  playFooterOrganGlyphSplash();
-  playGlyphBurst(footerGlyphBurstState, {
+  const didStart = playGlyphBurst(footerGlyphBurstState, {
     duration: FOOTER_WORD_EXPLOSION_DURATION,
     origin,
     coverageScale: 1.12,
     preserveTrailingCoverage: true,
     maxDpr: FOOTER_GLYPH_BURST_MAX_DPR,
   });
+  if (didStart) playFooterOrganGlyphSplash();
 }
 
 function resetFooterInteractionVisuals({ includeOwl = true } = {}) {
@@ -10847,6 +10848,7 @@ function setFooterInteractionFinal() {
   clearFooterInteractionCompletionFallback();
   footerInteractionTimeline?.kill();
   footerInteractionTimeline = null;
+  footerInteractionTimelinePrepared = false;
   setFooterInteractionState("complete");
   resetFooterInteractionVisuals({ includeOwl: false });
   setFooterWordsFinal();
@@ -10926,6 +10928,7 @@ function buildFooterInteractionTimeline() {
       overwrite: "auto",
     },
     onStart() {
+      footerInteractionTimelinePrepared = false;
       // Always restart the canvas loop with the footer timeline. This closes
       // the fast-scroll race where the transform tween runs while the owl's
       // internal frames remain paused.
@@ -10948,11 +10951,11 @@ function buildFooterInteractionTimeline() {
 
   const wordRevealStart = 0;
   timeline.addLabel("wordReveal", wordRevealStart);
-  addFooterGlitchWordSteps(timeline, footerDesignWord, wordRevealStart + 0.08);
+  addFooterGlitchWordSteps(timeline, footerDesignWord, wordRevealStart);
   addFooterGlitchWordSteps(
     timeline,
     footerEngineerWord,
-    wordRevealStart + 0.08 + FOOTER_GLITCH_WORD_GAP,
+    wordRevealStart + FOOTER_GLITCH_WORD_GAP,
   );
 
   timeline.addLabel("owlBurst", 1.12);
@@ -11047,6 +11050,20 @@ function buildFooterInteractionTimeline() {
   return timeline;
 }
 
+function prepareFooterInteractionTimeline() {
+  if (
+    !(workOwlScene instanceof HTMLElement) ||
+    footerInteractionState !== "idle" ||
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  ) {
+    return;
+  }
+
+  footerInteractionTimeline?.kill();
+  footerInteractionTimeline = buildFooterInteractionTimeline();
+  footerInteractionTimelinePrepared = footerInteractionTimeline !== null;
+}
+
 function playFooterInteraction() {
   if (document.body.dataset.currentPage !== "work") return;
   if (!(workOwlScene instanceof HTMLElement)) return;
@@ -11069,7 +11086,10 @@ function playFooterInteraction() {
     return;
   }
 
-  if (footerInteractionTimeline !== null) {
+  if (
+    footerInteractionTimeline !== null &&
+    !footerInteractionTimelinePrepared
+  ) {
     // A non-active, incomplete timeline is a previously interrupted opening.
     // Never resume it midway: rebuild the opening from its authoritative
     // initial frame so text, glyph burst, and owl cannot be skipped.
@@ -11117,8 +11137,11 @@ function playFooterInteraction() {
     return;
   }
 
-  footerInteractionTimeline?.kill();
-  footerInteractionTimeline = buildFooterInteractionTimeline();
+  if (!footerInteractionTimelinePrepared) {
+    footerInteractionTimeline?.kill();
+    footerInteractionTimeline = buildFooterInteractionTimeline();
+  }
+  footerInteractionTimelinePrepared = false;
   setFooterInteractionState("playing");
   footerInteractionTimeline?.play(0);
 
@@ -11145,6 +11168,7 @@ function resetFooterInteraction() {
   clearFooterInteractionCompletionFallback();
   footerInteractionTimeline?.kill();
   footerInteractionTimeline = null;
+  footerInteractionTimelinePrepared = false;
   setFooterInteractionState("idle");
   workOwlSceneHasEntered = false;
   workOwlSceneHasLanded = false;
@@ -12197,6 +12221,7 @@ function setupWorkOwlScene() {
   workOwlScenePresenceScrollTrigger = null;
   workOwlSceneEnterTween = null;
   footerInteractionTimeline = null;
+  footerInteractionTimelinePrepared = false;
   setFooterInteractionState("idle");
   workOwlSceneActive = false;
   workOwlSceneRendering = false;
@@ -12780,6 +12805,31 @@ function buildGlyphBurst(state, origin = null) {
   return true;
 }
 
+function isGlyphBurstPrepared(state, origin = null) {
+  if (
+    !(state?.canvas instanceof HTMLCanvasElement) ||
+    state.ctx === null ||
+    state.glyphs.length === 0
+  ) {
+    return false;
+  }
+
+  const bounds = state.canvas.getBoundingClientRect();
+  const width = Math.max(1, Math.round(bounds.width));
+  const height = Math.max(1, Math.round(bounds.height));
+  const dpr = Math.min(window.devicePixelRatio || 1, state.maxDpr);
+  const originX = Number.isFinite(origin?.x) ? origin.x : width * 0.5;
+  const originY = Number.isFinite(origin?.y) ? origin.y : height * 0.5;
+
+  return (
+    state.width === width &&
+    state.height === height &&
+    state.dpr === dpr &&
+    Math.abs(state.originX - originX) < 0.5 &&
+    Math.abs(state.originY - originY) < 0.5
+  );
+}
+
 function clearGlyphBurst(state) {
   if (
     !(state?.canvas instanceof HTMLCanvasElement) ||
@@ -12972,13 +13022,18 @@ function playGlyphBurst(
 
   const initialOrigin = originProvider?.() ?? origin;
 
+  // Never allocate a full-screen glyph field on a scroll callback. A cold
+  // Safari visit can otherwise spend its first section frame building and
+  // uploading thousands of glyphs while the underlying content is hidden.
+  // The burst is decorative: if idle-time preparation missed its deadline,
+  // skip it for this pass and keep the cards/footer responsive.
   if (
     window.matchMedia("(prefers-reduced-motion: reduce)").matches ||
-    !buildGlyphBurst(state, initialOrigin) ||
+    !isGlyphBurstPrepared(state, initialOrigin) ||
     !(state.canvas instanceof HTMLCanvasElement)
   ) {
     onFinish?.();
-    return;
+    return false;
   }
 
   state.timeline?.kill();
@@ -13009,6 +13064,8 @@ function playGlyphBurst(
         renderGlyphBurst(state, motion.progress);
       },
     }, 0);
+
+  return true;
 }
 
 function stopCapabilityGlyphBurst() {
@@ -13016,8 +13073,9 @@ function stopCapabilityGlyphBurst() {
 }
 
 function playCapabilityGlyphBurst() {
-  playGlyphSplash();
-  playGlyphBurst(capabilityGlyphBurstState);
+  if (playGlyphBurst(capabilityGlyphBurstState)) {
+    playGlyphSplash();
+  }
 }
 
 function setupCapabilityCards() {
@@ -15827,6 +15885,9 @@ function scheduleViewportResize() {
         ScrollTrigger.refresh();
         syncWorkWaveGalleryToScroll();
         scheduleCriticalSceneSync();
+        prewarmDeferredCanvasEffects()
+          .then(prepareFooterInteractionTimeline)
+          .catch(() => {});
       }
     });
   }, 120);
@@ -15903,10 +15964,11 @@ async function boot() {
   const galleryAssetsReady = warmWorkWaveAssets().catch((error) => {
     console.error("Unable to warm the gallery assets.", error);
   });
-  const canvasEffectsReady = Promise.all([
-    introOwlPreload,
-    capabilityAssetsReady,
-  ]).then(() => prewarmDeferredCanvasEffects());
+  // Canvas preparation is intentionally independent from image decoding.
+  // On a cold connection the card textures may take longer, but that must
+  // never postpone burst/footer preparation until the user reaches them.
+  const canvasEffectsReady = Promise.resolve(introOwlPreload)
+    .then(() => prewarmDeferredCanvasEffects());
 
   window.addEventListener("resize", handleWindowResize, { passive: true });
   window.visualViewport?.addEventListener("resize", handleVisualViewportResize, {
@@ -15926,6 +15988,7 @@ async function boot() {
     3200,
   );
   await settleWithTimeout(canvasEffectsReady, 1600);
+  prepareFooterInteractionTimeline();
   resetIntroTyperReveal();
   resetRouteScrollToTop();
   ScrollTrigger.update();
