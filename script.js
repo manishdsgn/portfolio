@@ -21,9 +21,6 @@ import { CustomEase } from "gsap/CustomEase";
 import { SplitText } from "gsap/SplitText";
 
 gsap.registerPlugin(ScrollTrigger, CustomEase, SplitText);
-if ("scrollRestoration" in window.history) {
-  window.history.scrollRestoration = "manual";
-}
 const IS_SAFARI_BROWSER =
   navigator.vendor === "Apple Computer, Inc." &&
   /Safari/.test(navigator.userAgent) &&
