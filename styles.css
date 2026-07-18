@@ -5,7 +5,7 @@
   font-family: "Lay Grotesk";
   font-style: normal;
   font-weight: 400;
-  font-display: block;
+  font-display: swap;
   src: url("/fonts/LayGrotesk-Regular.otf") format("opentype");
 }
 
@@ -13,7 +13,7 @@
   font-family: "Instrument Serif";
   font-style: normal;
   font-weight: 400;
-  font-display: block;
+  font-display: swap;
   src: url("/fonts/InstrumentSerif-Regular.ttf") format("truetype");
 }
 
@@ -21,7 +21,7 @@
   font-family: Trattatello;
   font-style: normal;
   font-weight: 400;
-  font-display: block;
+  font-display: swap;
   src: url("/fonts/Trattatello.ttf") format("truetype");
 }
 
@@ -29,7 +29,7 @@
   font-family: "Geist Pixel Square";
   font-style: normal;
   font-weight: 400;
-  font-display: block;
+  font-display: swap;
   src: url("/fonts/geist-pixel/GeistPixel-Square.woff2") format("woff2");
 }
 
@@ -37,7 +37,7 @@
   font-family: "Geist Pixel Circular";
   font-style: normal;
   font-weight: 400;
-  font-display: block;
+  font-display: swap;
   src: url("/fonts/geist-pixel/GeistPixel-Circle.woff2") format("woff2");
 }
 
@@ -45,7 +45,7 @@
   font-family: "Geist Pixel Grid";
   font-style: normal;
   font-weight: 400;
-  font-display: block;
+  font-display: swap;
   src: url("/fonts/GeistPixel-Grid.woff2") format("woff2");
 }
 
@@ -53,7 +53,7 @@
   font-family: "Geist Pixel Line";
   font-style: normal;
   font-weight: 400;
-  font-display: block;
+  font-display: swap;
   src: url("/fonts/geist-pixel/GeistPixel-Line.woff2") format("woff2");
 }
 
@@ -1458,6 +1458,10 @@ body.capability-cards-active .capability-card__inner {
   transform-origin: 0 50%;
   content: "";
   transition: opacity 180ms ease;
+  will-change: auto;
+}
+
+body.capability-cards-active .capability-card__keyword::before {
   will-change: transform, opacity;
 }
 
@@ -1573,7 +1577,7 @@ body.capability-cards-active .capability-card__inner {
   opacity: 0;
   contain: strict;
   pointer-events: none;
-  will-change: opacity;
+  will-change: auto;
 }
 
 .site-footer__title {
@@ -1605,7 +1609,7 @@ body.capability-cards-active .capability-card__inner {
   transform: translate3d(-50%, -50%, 0);
   transform-origin: 50% 50%;
   user-select: none;
-  will-change: transform, opacity;
+  will-change: auto;
 }
 
 .site-footer__word--design {
@@ -1689,7 +1693,7 @@ body.capability-cards-active .capability-card__inner {
   pointer-events: none;
   transform: scaleY(0);
   transform-origin: 50% 100%;
-  will-change: opacity, transform;
+  will-change: auto;
 }
 
 .site-footer__mono-glow svg {
@@ -1710,7 +1714,7 @@ body.capability-cards-active .capability-card__inner {
   pointer-events: none;
   transform: translate3d(-100vw, 0, 0);
   transform-origin: 50% 50%;
-  will-change: opacity, transform;
+  will-change: auto;
 }
 
 .work-owl-flight-layer:not([data-work-owl-visible="true"]) {
@@ -1729,7 +1733,7 @@ body.capability-cards-active .capability-card__inner {
   transform: translate3d(-50%, -50%, 0) scaleX(-1);
   transform-origin: center;
   user-select: none;
-  will-change: transform;
+  will-change: auto;
 }
 
 .site-footer__copy-button {
@@ -1771,7 +1775,7 @@ body.capability-cards-active .capability-card__inner {
   transition:
     background 180ms ease,
     color 180ms ease;
-  will-change: opacity, transform;
+  will-change: auto;
 }
 
 .site-footer__copy-button:hover,
@@ -1800,7 +1804,7 @@ body.capability-cards-active .capability-card__inner {
   opacity: 0;
   visibility: hidden;
   transform: translate3d(0, 16px, 0);
-  will-change: opacity, transform;
+  will-change: auto;
 }
 
 .site-footer__socials a {
@@ -1821,7 +1825,40 @@ body.capability-cards-active .capability-card__inner {
   transform: translate3d(0, 12px, 0);
   text-shadow: 0 1px 12px rgba(255, 255, 255, 0.48);
   transition: color 180ms ease;
+  will-change: auto;
+}
+
+.site-footer .footer-glitch-word::before,
+.site-footer .footer-glitch-word__copy {
+  will-change: auto;
+}
+
+.work-owl-scene[data-footer-interaction-state="playing"]
+  .site-footer__glyph-burst {
+  will-change: opacity;
+}
+
+.work-owl-scene[data-footer-interaction-state="playing"] .site-footer__word,
+.work-owl-scene[data-footer-interaction-state="playing"]
+  .footer-glitch-word::before,
+.work-owl-scene[data-footer-interaction-state="playing"] .site-footer__mono-glow,
+.work-owl-scene[data-footer-interaction-state="playing"] .work-owl-flight-layer,
+.work-owl-scene[data-footer-interaction-state="playing"]
+  .site-footer__copy-button,
+.work-owl-scene[data-footer-interaction-state="playing"] .site-footer__socials,
+.work-owl-scene[data-footer-interaction-state="playing"]
+  .site-footer__socials
+  a {
   will-change: opacity, transform;
+}
+
+.work-owl-scene[data-footer-interaction-state="playing"]
+  .footer-glitch-word__copy {
+  will-change: clip-path, opacity, transform;
+}
+
+.work-owl-scene[data-footer-interaction-state="playing"] .work-owl-canvas {
+  will-change: transform;
 }
 
 .site-footer__socials a:hover,

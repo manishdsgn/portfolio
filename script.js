@@ -26,14 +26,55 @@ const IS_SAFARI_BROWSER =
   navigator.vendor === "Apple Computer, Inc." &&
   /Safari/.test(navigator.userAgent) &&
   !/(CriOS|FxiOS|EdgiOS|OPiOS)/.test(navigator.userAgent);
+
+function moveSoundEffectsToLayers(definition, extraEffects = []) {
+  const {
+    effects: definitionEffects = [],
+    layers,
+    ...singleLayer
+  } = definition;
+  const sharedEffects = [...definitionEffects, ...extraEffects];
+
+  if (Array.isArray(layers)) {
+    return Object.freeze({
+      ...singleLayer,
+      layers: Object.freeze(layers.map((layer) => Object.freeze({
+        ...layer,
+        effects: Object.freeze([
+          ...(layer.effects ?? []),
+          ...sharedEffects,
+        ]),
+      }))),
+    });
+  }
+
+  return Object.freeze({
+    layers: Object.freeze([
+      Object.freeze({
+        ...singleLayer,
+        effects: Object.freeze(sharedEffects),
+      }),
+    ]),
+  });
+}
+
+function removeDefinitionEffects(definition) {
+  const { effects: _effects, ...effectSafeDefinition } = definition;
+  return Object.freeze(effectSafeDefinition);
+}
+
 const playGlyphSplashSound = defineSound(tomGlyphRhythm);
-const playFooterOrganGlyphSound = defineSound(footerOrganGlyphRhythm);
+// @web-kits/audio 0.1 leaves definition-level effect chains connected after a
+// voice ends. The shared project limiter already provides the same peak
+// protection, so keep this recurring rhythm free of persistent effect nodes.
+const playFooterOrganGlyphSound = defineSound(
+  removeDefinitionEffects(footerOrganGlyphRhythm),
+);
 const playMinimalPopSound = defineSound(minimalPop);
 const playMinimalTapSound = defineSound(minimalTap);
-const introKeyPressSound = Object.freeze({
-  ...softKeyPress,
-  effects: Object.freeze([
-    ...(softKeyPress.effects ?? []),
+const introKeyPressSound = moveSoundEffectsToLayers(
+  softKeyPress,
+  [
     {
       type: "compressor",
       threshold: -24,
@@ -42,12 +83,11 @@ const introKeyPressSound = Object.freeze({
       attack: 0.001,
       release: 0.06,
     },
-  ]),
-});
-const introHighlightSwoosh = Object.freeze({
-  ...organicSwoosh,
-  effects: Object.freeze([
-    ...(organicSwoosh.effects ?? []),
+  ],
+);
+const introHighlightSwoosh = moveSoundEffectsToLayers(
+  organicSwoosh,
+  [
     {
       type: "compressor",
       threshold: -20,
@@ -56,8 +96,8 @@ const introHighlightSwoosh = Object.freeze({
       attack: 0.002,
       release: 0.16,
     },
-  ]),
-});
+  ],
+);
 const playOrganicSwooshSound = defineSound(introHighlightSwoosh);
 const playSoftKeyPressSound = defineSound(introKeyPressSound);
 const playMechanicalNotificationSound = defineSound(mechanicalNotification);
@@ -101,24 +141,19 @@ const FOOTER_AMBIENT_START_TIME = 0.55;
 const FOOTER_AMBIENT_VOLUME = 0.18;
 const FOOTER_AMBIENT_DURATION = 2.28;
 const FOOTER_AMBIENT_FADE_OUT_DURATION = 0.86;
-const cameraAmbientAudio = new Audio(CAMERA_AMBIENT_SOUND_PATH);
-cameraAmbientAudio.preload = "auto";
-cameraAmbientAudio.playsInline = true;
-cameraAmbientAudio.volume = 0;
-const footerAmbientAudio = new Audio(CAMERA_AMBIENT_SOUND_PATH);
-footerAmbientAudio.preload = "auto";
-footerAmbientAudio.playsInline = true;
-footerAmbientAudio.volume = 0;
-footerAmbientAudio.preservesPitch = false;
+const AMBIENT_RELEASE_DURATION = 0.035;
 let projectSoundEnabled = false;
 let webKitsAudioReady = false;
 let webKitsAudioUnlockPromise = null;
 let projectAudioContext = null;
 let projectAudioLimiter = null;
-let cameraAmbientSource = null;
-let footerAmbientSource = null;
-let cameraAmbientGain = null;
-let footerAmbientGain = null;
+let projectAudioCeiling = null;
+let ambientEncodedAudioPromise = null;
+let ambientAudioBufferPromise = null;
+let ambientAudioBuffer = null;
+let ambientAudioBufferContext = null;
+let cameraAmbientVoice = null;
+let footerAmbientVoice = null;
 let cameraAmbientAttempt = 0;
 let footerAmbientAttempt = 0;
 let pendingClickStatePop = false;
@@ -127,11 +162,11 @@ let glyphSplashSampleReady = false;
 let glyphSplashSampleLoadPromise = null;
 let cameraAmbientArmed = false;
 let cameraAmbientPlayPending = false;
-let cameraAmbientVolumeTimeline = null;
-let cameraAmbientPrimePromise = null;
 let footerAmbientPlayPending = false;
-let footerAmbientVolumeTimeline = null;
-let footerAmbientPrimePromise = null;
+let footerAmbientEpoch = 0;
+let footerAmbientRequestedEpoch = -1;
+let footerAmbientPlayedEpoch = -1;
+let audioNeedsTrustedUnlock = false;
 let introKeyPressLastPlayedAt = Number.NEGATIVE_INFINITY;
 let introKeyPressStep = 0;
 const introKeyPressVoices = [];
@@ -143,50 +178,26 @@ const introHighlightSwooshVoices = [];
 let pageTransitionNoiseVoice = null;
 let galleryPopLastPlayedAt = Number.NEGATIVE_INFINITY;
 let capabilityTapLastPlayedAt = Number.NEGATIVE_INFINITY;
-const pendingMediaSeekHandlers = new WeakMap();
-
-function safeSetMediaTime(media, time) {
-  const previousHandler = pendingMediaSeekHandlers.get(media);
-  if (previousHandler) {
-    media.removeEventListener("loadedmetadata", previousHandler);
-    pendingMediaSeekHandlers.delete(media);
-  }
-
-  const applySeek = () => {
-    pendingMediaSeekHandlers.delete(media);
-    try {
-      media.currentTime = time;
-    } catch {
-      // A media error should not block the visual experience.
-    }
-  };
-
-  if (media.readyState === HTMLMediaElement.HAVE_NOTHING) {
-    pendingMediaSeekHandlers.set(media, applySeek);
-    media.addEventListener("loadedmetadata", applySeek, { once: true });
-    return;
-  }
-
-  try {
-    media.currentTime = time;
-  } catch {
-    pendingMediaSeekHandlers.set(media, applySeek);
-    media.addEventListener("loadedmetadata", applySeek, { once: true });
-  }
-}
 
 function configureProjectAudioGraph() {
   const masterBus = getWebKitsAudioMasterBus();
   const context = masterBus.context;
 
   if (projectAudioContext !== context || projectAudioLimiter === null) {
+    cameraAmbientVoice = null;
+    footerAmbientVoice = null;
+    ambientAudioBuffer = null;
+    ambientAudioBufferPromise = null;
+    ambientAudioBufferContext = null;
     projectAudioContext = context;
     projectAudioLimiter = context.createDynamicsCompressor();
+    projectAudioCeiling = context.createGain();
     projectAudioLimiter.threshold.value = -12;
     projectAudioLimiter.knee.value = 6;
     projectAudioLimiter.ratio.value = 14;
     projectAudioLimiter.attack.value = 0.003;
     projectAudioLimiter.release.value = 0.14;
+    projectAudioCeiling.gain.value = 0.92;
 
     try {
       masterBus.disconnect();
@@ -194,56 +205,125 @@ function configureProjectAudioGraph() {
       // A newly-created bus may not have an active connection yet.
     }
     masterBus.connect(projectAudioLimiter);
-    projectAudioLimiter.connect(context.destination);
+    projectAudioLimiter.connect(projectAudioCeiling);
+    projectAudioCeiling.connect(context.destination);
 
     context.addEventListener("statechange", () => {
       webKitsAudioReady = context.state === "running";
+      audioNeedsTrustedUnlock = !webKitsAudioReady;
+      if (webKitsAudioReady) {
+        queueMicrotask(drainPendingLandmarkAudio);
+      }
     });
   }
 
   setWebKitsMasterVolume(PROJECT_AUDIO_MASTER_VOLUME);
 
-  // Route HTML media through the same master/limiter as generated effects.
-  // This keeps Safari from switching between two unrelated loudness paths.
-  if (cameraAmbientSource === null) {
-    cameraAmbientSource = context.createMediaElementSource(cameraAmbientAudio);
-    cameraAmbientGain = context.createGain();
-    cameraAmbientGain.gain.value = 0;
-    cameraAmbientSource.connect(cameraAmbientGain);
-    cameraAmbientGain.connect(masterBus);
-    cameraAmbientAudio.volume = 1;
-  }
-  if (footerAmbientSource === null) {
-    footerAmbientSource = context.createMediaElementSource(footerAmbientAudio);
-    footerAmbientGain = context.createGain();
-    footerAmbientGain.gain.value = 0;
-    footerAmbientSource.connect(footerAmbientGain);
-    footerAmbientGain.connect(masterBus);
-    footerAmbientAudio.volume = 1;
-  }
-
   return context;
 }
 
-function silenceAmbientGain(gainNode) {
-  if (gainNode === null) return;
-
-  const now = gainNode.context.currentTime;
-  gainNode.gain.cancelScheduledValues(now);
-  gainNode.gain.setValueAtTime(0, now);
+function isProjectAudioRunning() {
+  return (
+    projectSoundEnabled &&
+    projectAudioContext !== null &&
+    projectAudioContext.state === "running"
+  );
 }
 
-function scheduleAmbientGainEnvelope(gainNode, points) {
-  if (gainNode === null) return 0;
+function preloadAmbientEncodedAudio() {
+  if (ambientEncodedAudioPromise !== null) return ambientEncodedAudioPromise;
 
+  ambientEncodedAudioPromise = fetch(CAMERA_AMBIENT_SOUND_PATH)
+    .then((response) => {
+      if (!response.ok) {
+        throw new Error(`Unable to load ambient audio: ${response.status}`);
+      }
+      return response.arrayBuffer();
+    })
+    .catch((error) => {
+      ambientEncodedAudioPromise = null;
+      throw error;
+    });
+
+  return ambientEncodedAudioPromise;
+}
+
+function ensureAmbientAudioBuffer() {
+  if (projectAudioContext === null) {
+    return Promise.reject(new Error("AudioContext is not ready"));
+  }
+  if (
+    ambientAudioBuffer !== null &&
+    ambientAudioBufferContext === projectAudioContext
+  ) {
+    return Promise.resolve(ambientAudioBuffer);
+  }
+  if (ambientAudioBufferPromise !== null) return ambientAudioBufferPromise;
+
+  const context = projectAudioContext;
+  ambientAudioBufferPromise = preloadAmbientEncodedAudio()
+    .then((encodedAudio) => context.decodeAudioData(encodedAudio.slice(0)))
+    .then((decodedAudio) => {
+      if (projectAudioContext !== context) {
+        throw new Error("AudioContext changed while decoding ambience");
+      }
+      ambientAudioBuffer = decodedAudio;
+      ambientAudioBufferContext = context;
+      ambientAudioBufferPromise = null;
+      return decodedAudio;
+    })
+    .catch((error) => {
+      ambientAudioBufferPromise = null;
+      throw error;
+    });
+
+  return ambientAudioBufferPromise;
+}
+
+function holdAndReleaseGain(gainNode, duration = AMBIENT_RELEASE_DURATION) {
   const now = gainNode.context.currentTime;
-  gainNode.gain.cancelScheduledValues(now);
-  gainNode.gain.setValueAtTime(0, now);
+  if (typeof gainNode.gain.cancelAndHoldAtTime === "function") {
+    gainNode.gain.cancelAndHoldAtTime(now);
+  } else {
+    const currentValue = gainNode.gain.value;
+    gainNode.gain.cancelScheduledValues(now);
+    gainNode.gain.setValueAtTime(currentValue, now);
+  }
+  gainNode.gain.linearRampToValueAtTime(0, now + duration);
+  return now + duration;
+}
+
+function stopAmbientVoice(voice, duration = AMBIENT_RELEASE_DURATION) {
+  if (voice === null) return;
+
+  if (voice.gain.context.currentTime < voice.startTime) {
+    const now = voice.gain.context.currentTime;
+    voice.gain.gain.cancelScheduledValues(now);
+    voice.gain.gain.setValueAtTime(0, now);
+    try {
+      voice.source.stop(now);
+    } catch {
+      // The source may already have been stopped by route cleanup.
+    }
+    return;
+  }
+
+  const stopAt = holdAndReleaseGain(voice.gain, duration);
+  try {
+    voice.source.stop(stopAt + 0.01);
+  } catch {
+    // The source may already have reached its scheduled end.
+  }
+}
+
+function scheduleAmbientGainEnvelope(gainNode, startTime, points) {
+  gainNode.gain.cancelScheduledValues(startTime);
+  gainNode.gain.setValueAtTime(0, startTime);
   let elapsed = 0;
 
   points.forEach(({ value, duration }) => {
     elapsed += duration;
-    gainNode.gain.linearRampToValueAtTime(value, now + elapsed);
+    gainNode.gain.linearRampToValueAtTime(value, startTime + elapsed);
   });
 
   return elapsed;
@@ -262,6 +342,14 @@ async function ensureProjectAudioRunning() {
     throw new Error(`AudioContext is ${context.state}`);
   }
 
+  audioNeedsTrustedUnlock = false;
+  ensureAmbientAudioBuffer().catch(() => {
+    // Landmark cues retain their pending intent and retry on interaction.
+  });
+  // The UI timeout releases the startup screen, but the underlying Safari
+  // resume may still complete later. Drain here as well as on statechange so
+  // that late success cannot strand a requested landmark cue.
+  queueMicrotask(drainPendingLandmarkAudio);
   return context;
 }
 
@@ -280,7 +368,7 @@ function withProjectAudioTimeout(promise) {
 function playClickStatePop() {
   if (!projectSoundEnabled) return;
 
-  if (!webKitsAudioReady) {
+  if (!isProjectAudioRunning()) {
     pendingClickStatePop = true;
     return;
   }
@@ -290,7 +378,13 @@ function playClickStatePop() {
 }
 
 function primeGlyphSplashSample() {
-  if (glyphSplashSampleReady) return Promise.resolve();
+  if (glyphSplashSampleReady) {
+    if (pendingGlyphSplash && isProjectAudioRunning()) {
+      pendingGlyphSplash = false;
+      playGlyphSplashSound({ volume: GLYPH_SPLASH_VOLUME });
+    }
+    return Promise.resolve();
+  }
   if (glyphSplashSampleLoadPromise !== null) {
     return glyphSplashSampleLoadPromise;
   }
@@ -305,7 +399,7 @@ function primeGlyphSplashSample() {
   ) {
     glyphSplashSampleReady = true;
 
-    if (pendingGlyphSplash && projectSoundEnabled) {
+    if (pendingGlyphSplash && isProjectAudioRunning()) {
       pendingGlyphSplash = false;
       playGlyphSplashSound({ volume: GLYPH_SPLASH_VOLUME });
     }
@@ -327,7 +421,7 @@ function primeGlyphSplashSample() {
       glyphSplashSampleReady = true;
       glyphSplashSampleLoadPromise = null;
 
-      if (pendingGlyphSplash && projectSoundEnabled) {
+      if (pendingGlyphSplash && isProjectAudioRunning()) {
         pendingGlyphSplash = false;
         playGlyphSplashSound({ volume: GLYPH_SPLASH_VOLUME });
       }
@@ -343,9 +437,9 @@ function primeGlyphSplashSample() {
 function playGlyphSplash() {
   if (!projectSoundEnabled) return;
 
-  if (!webKitsAudioReady || !glyphSplashSampleReady) {
+  if (!isProjectAudioRunning() || !glyphSplashSampleReady) {
     pendingGlyphSplash = true;
-    if (webKitsAudioReady) primeGlyphSplashSample();
+    if (isProjectAudioRunning()) primeGlyphSplashSample();
     return;
   }
 
@@ -353,13 +447,13 @@ function playGlyphSplash() {
 }
 
 function playFooterOrganGlyphSplash() {
-  if (!projectSoundEnabled || !webKitsAudioReady) return;
+  if (!isProjectAudioRunning()) return;
 
   playFooterOrganGlyphSound({ volume: FOOTER_ORGAN_GLYPH_VOLUME });
 }
 
 function playGalleryPop() {
-  if (!projectSoundEnabled || !webKitsAudioReady) return;
+  if (!isProjectAudioRunning()) return;
 
   const now = performance.now();
   if (now - galleryPopLastPlayedAt < GALLERY_POP_MIN_INTERVAL_MS) return;
@@ -370,8 +464,7 @@ function playGalleryPop() {
 
 function playCapabilityHighlightTap(volume = CAPABILITY_HIGHLIGHT_INITIAL_TAP_VOLUME) {
   if (
-    !projectSoundEnabled
-    || !webKitsAudioReady
+    !isProjectAudioRunning()
     || document.body.dataset.currentPage !== "work"
   ) return;
 
@@ -391,13 +484,13 @@ function playCapabilityHighlightTap(volume = CAPABILITY_HIGHLIGHT_INITIAL_TAP_VO
 }
 
 function playDotGlitchNotification() {
-  if (!projectSoundEnabled || !webKitsAudioReady) return;
+  if (!isProjectAudioRunning()) return;
 
   playMechanicalNotificationSound({ volume: DOT_GLITCH_NOTIFICATION_VOLUME });
 }
 
 function startPageTransitionNoise() {
-  if (!projectSoundEnabled || !webKitsAudioReady) return;
+  if (!isProjectAudioRunning()) return;
 
   pageTransitionNoiseVoice?.stop(PAGE_TRANSITION_NOISE_FADE_OUT_DURATION);
   pageTransitionNoiseVoice = playPageTransitionNoiseSound({
@@ -465,9 +558,12 @@ function drainIntroHighlightSwooshQueue() {
     return;
   }
 
-  // Keep notes that arrive while the browser is still unlocking Web Audio.
-  // The unlock completion calls this drain again, preserving every highlight.
-  if (!webKitsAudioReady) return;
+  // Never backlog micro-cues across a Safari interruption. Releasing several
+  // queued voices together on resume is perceived as a sudden loud jump.
+  if (!isProjectAudioRunning()) {
+    introHighlightSwooshQueue.length = 0;
+    return;
+  }
 
   const elapsed = performance.now() - introHighlightSwooshLastPlayedAt;
   const wait = Math.max(0, INTRO_HIGHLIGHT_SWOOSH_MIN_INTERVAL_MS - elapsed);
@@ -493,7 +589,7 @@ function drainIntroHighlightSwooshQueue() {
 }
 
 function playIntroHighlightSwoosh(word) {
-  if (!projectSoundEnabled) return;
+  if (!isProjectAudioRunning()) return;
   if (!(word instanceof HTMLElement)) return;
   if (introHighlightSwooshPlayedWords.has(word)) return;
 
@@ -539,7 +635,7 @@ function stopIntroKeyPressVoice(entry) {
 }
 
 function playIntroKeyPressRhythm() {
-  if (!projectSoundEnabled || !webKitsAudioReady) return;
+  if (!isProjectAudioRunning()) return;
 
   const now = performance.now();
   if (now - introKeyPressLastPlayedAt < INTRO_KEY_PRESS_MIN_INTERVAL_MS) return;
@@ -573,59 +669,92 @@ function playIntroKeyPressRhythm() {
   introKeyPressVoices.push(entry);
 }
 
-function startCameraAmbientSwell() {
+function createAmbientVoice({
+  buffer,
+  offset,
+  envelope,
+  onEnded,
+}) {
+  if (projectAudioContext === null) return null;
+
+  const context = projectAudioContext;
+  const masterBus = getWebKitsAudioMasterBus();
+  const source = context.createBufferSource();
+  const gain = context.createGain();
+  const startTime = context.currentTime + 0.008;
+  const safeOffset = clamp(offset, 0, Math.max(0, buffer.duration - 0.001));
+  source.buffer = buffer;
+  // A GainNode defaults to unity. Set it silent immediately so cancelling a
+  // just-scheduled cue before `startTime` can never expose a one-frame burst.
+  gain.gain.setValueAtTime(0, context.currentTime);
+  source.connect(gain);
+  gain.connect(masterBus);
+  const envelopeDuration = scheduleAmbientGainEnvelope(gain, startTime, envelope);
+  const availableDuration = Math.max(0.01, buffer.duration - safeOffset);
+  const stopTime = startTime + Math.min(availableDuration, envelopeDuration + 0.04);
+  const voice = { source, gain, startTime, stopTime };
+
+  source.onended = () => {
+    try {
+      source.disconnect();
+      gain.disconnect();
+    } catch {
+      // Nodes may already be disconnected during route cleanup.
+    }
+    onEnded?.(voice);
+  };
+  source.start(startTime, safeOffset);
+  source.stop(stopTime);
+  return voice;
+}
+
+async function startCameraAmbientSwell() {
   if (
     !projectSoundEnabled ||
     !cameraAmbientArmed ||
-    cameraAmbientGain === null ||
-    projectAudioContext?.state !== "running" ||
     cameraAmbientPlayPending ||
-    cameraAmbientVolumeTimeline !== null
+    cameraAmbientVoice !== null
   ) return;
+
+  if (!isProjectAudioRunning()) {
+    audioNeedsTrustedUnlock = true;
+    return;
+  }
 
   cameraAmbientPlayPending = true;
   const attempt = ++cameraAmbientAttempt;
-  cameraAmbientAudio.pause();
-  safeSetMediaTime(cameraAmbientAudio, 0);
-  cameraAmbientAudio.volume = 1;
-  silenceAmbientGain(cameraAmbientGain);
 
-  Promise.resolve(cameraAmbientAudio.play())
-    .then(() => {
-      if (
-        attempt !== cameraAmbientAttempt ||
-        !cameraAmbientArmed ||
-        !isCameraAmbientContextActive()
-      ) {
-        cameraAmbientPlayPending = false;
-        cameraAmbientAudio.pause();
-        safeSetMediaTime(cameraAmbientAudio, 0);
-        silenceAmbientGain(cameraAmbientGain);
-        return;
-      }
+  try {
+    const buffer = await ensureAmbientAudioBuffer();
+    if (
+      attempt !== cameraAmbientAttempt ||
+      !cameraAmbientArmed ||
+      !isProjectAudioRunning() ||
+      !isCameraAmbientContextActive()
+    ) {
+      return;
+    }
 
-      cameraAmbientPlayPending = false;
-      cameraAmbientArmed = false;
-      const envelopeDuration = scheduleAmbientGainEnvelope(cameraAmbientGain, [
+    cameraAmbientArmed = false;
+    cameraAmbientVoice = createAmbientVoice({
+      buffer,
+      offset: 0,
+      envelope: [
         { value: CAMERA_AMBIENT_RISE_VOLUME, duration: 0.45 },
         { value: CAMERA_AMBIENT_PEAK_VOLUME, duration: 0.75 },
         { value: 0, duration: 1.75 },
-      ]);
-      cameraAmbientVolumeTimeline = gsap.delayedCall(envelopeDuration, () => {
-        cameraAmbientAudio.pause();
-        safeSetMediaTime(cameraAmbientAudio, 0);
-        silenceAmbientGain(cameraAmbientGain);
-        cameraAmbientVolumeTimeline = null;
-      });
-    })
-    .catch(() => {
-      if (attempt === cameraAmbientAttempt) {
-        cameraAmbientPlayPending = false;
-        cameraAmbientPrimePromise = null;
-        cameraAmbientAudio.pause();
-        silenceAmbientGain(cameraAmbientGain);
-      }
+      ],
+      onEnded(voice) {
+        if (cameraAmbientVoice === voice) cameraAmbientVoice = null;
+      },
     });
+  } catch {
+    if (attempt === cameraAmbientAttempt && cameraAmbientArmed) {
+      audioNeedsTrustedUnlock = true;
+    }
+  } finally {
+    if (attempt === cameraAmbientAttempt) cameraAmbientPlayPending = false;
+  }
 }
 
 function isCameraAmbientContextActive() {
@@ -646,194 +775,165 @@ function playCameraRenderAmbient() {
   }
 
   cameraAmbientArmed = true;
-  startCameraAmbientSwell();
+  startCameraAmbientSwell().catch(() => {});
 }
 
 function stopCameraAmbientSwell() {
   cameraAmbientAttempt += 1;
   cameraAmbientArmed = false;
   cameraAmbientPlayPending = false;
-  cameraAmbientVolumeTimeline?.kill();
-  cameraAmbientVolumeTimeline = null;
-  cameraAmbientAudio.pause();
-  safeSetMediaTime(cameraAmbientAudio, 0);
-  silenceAmbientGain(cameraAmbientGain);
+  const voice = cameraAmbientVoice;
+  cameraAmbientVoice = null;
+  stopAmbientVoice(voice);
 }
 
-function primeCameraAmbientAudio() {
-  if (cameraAmbientPrimePromise !== null) return;
+async function playRequestedFooterAmbient(epoch) {
+  if (
+    !projectSoundEnabled ||
+    document.body.dataset.currentPage !== "work" ||
+    footerAmbientRequestedEpoch !== epoch ||
+    epoch !== footerAmbientEpoch ||
+    footerAmbientPlayedEpoch === epoch ||
+    footerAmbientPlayPending ||
+    footerAmbientVoice !== null
+  ) return;
 
-  cameraAmbientAudio.pause();
-  safeSetMediaTime(cameraAmbientAudio, 0);
-  cameraAmbientAudio.volume = cameraAmbientGain === null ? 0 : 1;
-  silenceAmbientGain(cameraAmbientGain);
-  let playbackAttempt;
-  try {
-    playbackAttempt = cameraAmbientAudio.play();
-  } catch {
+  if (!isProjectAudioRunning()) {
+    audioNeedsTrustedUnlock = true;
     return;
   }
 
-  cameraAmbientPrimePromise = Promise.resolve(playbackAttempt)
-    .then(() => {
-      if (cameraAmbientArmed || cameraAmbientVolumeTimeline !== null) return;
-      cameraAmbientAudio.pause();
-      safeSetMediaTime(cameraAmbientAudio, 0);
-    })
-    .catch(() => {})
-    .finally(() => {
-      cameraAmbientPrimePromise = null;
+  footerAmbientPlayPending = true;
+  const attempt = ++footerAmbientAttempt;
+
+  try {
+    const buffer = await ensureAmbientAudioBuffer();
+    if (
+      attempt !== footerAmbientAttempt ||
+      footerAmbientRequestedEpoch !== epoch ||
+      epoch !== footerAmbientEpoch ||
+      !isProjectAudioRunning() ||
+      document.body.dataset.currentPage !== "work"
+    ) {
+      return;
+    }
+
+    const holdDuration = Math.max(
+      0,
+      FOOTER_AMBIENT_DURATION - 0.12 - FOOTER_AMBIENT_FADE_OUT_DURATION,
+    );
+    footerAmbientVoice = createAmbientVoice({
+      buffer,
+      offset: FOOTER_AMBIENT_START_TIME,
+      envelope: [
+        { value: FOOTER_AMBIENT_VOLUME, duration: 0.12 },
+        { value: FOOTER_AMBIENT_VOLUME, duration: holdDuration },
+        { value: 0, duration: FOOTER_AMBIENT_FADE_OUT_DURATION },
+      ],
+      onEnded(voice) {
+        if (footerAmbientVoice === voice) footerAmbientVoice = null;
+      },
     });
+    if (footerAmbientVoice !== null) {
+      footerAmbientPlayedEpoch = epoch;
+    }
+  } catch {
+    if (
+      attempt === footerAmbientAttempt &&
+      footerAmbientRequestedEpoch === epoch
+    ) {
+      audioNeedsTrustedUnlock = true;
+    }
+  } finally {
+    if (attempt === footerAmbientAttempt) footerAmbientPlayPending = false;
+  }
 }
 
 function startFooterAmbientOutro() {
   if (
     !projectSoundEnabled ||
     document.body.dataset.currentPage !== "work" ||
-    footerAmbientGain === null ||
-    projectAudioContext?.state !== "running" ||
-    footerAmbientPlayPending ||
-    footerAmbientVolumeTimeline !== null
+    footerAmbientRequestedEpoch === footerAmbientEpoch ||
+    footerAmbientPlayedEpoch === footerAmbientEpoch
   ) return;
 
-  footerAmbientPlayPending = true;
-  const attempt = ++footerAmbientAttempt;
-  footerAmbientAudio.pause();
-  safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
-  footerAmbientAudio.playbackRate = 1;
-  footerAmbientAudio.volume = 1;
-  silenceAmbientGain(footerAmbientGain);
-
-  Promise.resolve(footerAmbientAudio.play())
-    .then(() => {
-      if (
-        attempt !== footerAmbientAttempt ||
-        !projectSoundEnabled ||
-        document.body.dataset.currentPage !== "work"
-      ) {
-        footerAmbientPlayPending = false;
-        footerAmbientAudio.pause();
-        safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
-        footerAmbientAudio.playbackRate = 1;
-        silenceAmbientGain(footerAmbientGain);
-        return;
-      }
-
-      footerAmbientPlayPending = false;
-      const holdDuration = Math.max(
-        0,
-        FOOTER_AMBIENT_DURATION - 0.12 - FOOTER_AMBIENT_FADE_OUT_DURATION,
-      );
-      const envelopeDuration = scheduleAmbientGainEnvelope(footerAmbientGain, [
-        { value: FOOTER_AMBIENT_VOLUME, duration: 0.12 },
-        { value: FOOTER_AMBIENT_VOLUME, duration: holdDuration },
-        { value: 0, duration: FOOTER_AMBIENT_FADE_OUT_DURATION },
-      ]);
-      footerAmbientVolumeTimeline = gsap.delayedCall(envelopeDuration, () => {
-        footerAmbientAudio.pause();
-        safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
-        footerAmbientAudio.playbackRate = 1;
-        silenceAmbientGain(footerAmbientGain);
-        footerAmbientVolumeTimeline = null;
-      });
-    })
-    .catch(() => {
-      if (attempt === footerAmbientAttempt) {
-        footerAmbientPlayPending = false;
-        footerAmbientPrimePromise = null;
-        footerAmbientAudio.pause();
-        silenceAmbientGain(footerAmbientGain);
-      }
-    });
+  footerAmbientRequestedEpoch = footerAmbientEpoch;
+  playRequestedFooterAmbient(footerAmbientEpoch).catch(() => {});
 }
 
 function stopFooterAmbientOutro() {
   footerAmbientAttempt += 1;
   footerAmbientPlayPending = false;
-  footerAmbientVolumeTimeline?.kill();
-  footerAmbientVolumeTimeline = null;
-  footerAmbientAudio.pause();
-  safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
-  footerAmbientAudio.playbackRate = 1;
-  silenceAmbientGain(footerAmbientGain);
+  footerAmbientRequestedEpoch = -1;
+  const voice = footerAmbientVoice;
+  footerAmbientVoice = null;
+  stopAmbientVoice(voice);
 }
 
-function primeFooterAmbientAudio() {
-  if (footerAmbientPrimePromise !== null) return;
+function beginFooterAmbientEpoch() {
+  stopFooterAmbientOutro();
+  footerAmbientEpoch += 1;
+  footerAmbientPlayedEpoch = -1;
+}
 
-  footerAmbientAudio.pause();
-  safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
-  footerAmbientAudio.playbackRate = 1;
-  footerAmbientAudio.volume = footerAmbientGain === null ? 0 : 1;
-  silenceAmbientGain(footerAmbientGain);
+function drainPendingLandmarkAudio() {
+  if (!isProjectAudioRunning()) return;
 
-  let playbackAttempt;
-  try {
-    playbackAttempt = footerAmbientAudio.play();
-  } catch {
-    return;
+  primeGlyphSplashSample();
+  drainIntroHighlightSwooshQueue();
+  if (pendingClickStatePop) {
+    pendingClickStatePop = false;
+    playMinimalPopSound();
   }
+  if (cameraAmbientArmed && isCameraAmbientContextActive()) {
+    startCameraAmbientSwell().catch(() => {});
+  }
+  if (footerAmbientRequestedEpoch === footerAmbientEpoch) {
+    playRequestedFooterAmbient(footerAmbientEpoch).catch(() => {});
+  }
+}
 
-  footerAmbientPrimePromise = Promise.resolve(playbackAttempt)
-    .then(() => {
-      if (footerAmbientPlayPending || footerAmbientVolumeTimeline !== null) return;
-      footerAmbientAudio.pause();
-      safeSetMediaTime(footerAmbientAudio, FOOTER_AMBIENT_START_TIME);
-    })
-    .catch(() => {})
-    .finally(() => {
-      footerAmbientPrimePromise = null;
-    });
+function isTrustedAudioUnlockEvent(event) {
+  return (
+    event instanceof Event &&
+    event.isTrusted &&
+    ["pointerdown", "touchstart", "mousedown", "click", "keydown"].includes(
+      event.type,
+    )
+  );
+}
+
+function markProjectAudioForTrustedRecovery() {
+  if (!projectSoundEnabled || isProjectAudioRunning()) return;
+
+  webKitsAudioReady = false;
+  audioNeedsTrustedUnlock = true;
 }
 
 function unlockProjectAudio(event) {
   if (!projectSoundEnabled) return Promise.resolve();
 
-  const eventTarget = event?.target;
-  const navigationTarget = eventTarget instanceof Element
-    ? eventTarget.closest("[data-nav-target]")?.dataset.navTarget
-    : null;
-  const isCameraInteraction =
-    event?.type === "keydown" ||
-    (
-      eventTarget instanceof Node &&
-      (stage.contains(eventTarget) || navigationTarget === "work")
-    );
-
-  if (
-    webKitsAudioReady &&
-    projectAudioContext?.state === "running"
-  ) {
-    if (
-      cameraAmbientArmed &&
-      isCameraAmbientContextActive() &&
-      isCameraInteraction
-    ) {
-      startCameraAmbientSwell();
-    }
+  if (isProjectAudioRunning()) {
+    webKitsAudioReady = true;
+    audioNeedsTrustedUnlock = false;
+    drainPendingLandmarkAudio();
     return Promise.resolve(projectAudioContext);
+  }
+
+  if (!isTrustedAudioUnlockEvent(event)) {
+    markProjectAudioForTrustedRecovery();
+    return Promise.resolve(null);
   }
   if (webKitsAudioUnlockPromise !== null) return webKitsAudioUnlockPromise;
 
   webKitsAudioUnlockPromise = withProjectAudioTimeout(ensureProjectAudioRunning())
     .then((context) => {
-      if (
-        cameraAmbientArmed &&
-        isCameraAmbientContextActive() &&
-        isCameraInteraction
-      ) {
-        startCameraAmbientSwell();
-      }
-      primeGlyphSplashSample();
-      drainIntroHighlightSwooshQueue();
-      if (pendingClickStatePop && projectSoundEnabled) {
-        pendingClickStatePop = false;
-        playMinimalPopSound();
-      }
+      drainPendingLandmarkAudio();
       return context;
     })
     .catch(() => {
       webKitsAudioReady = false;
+      audioNeedsTrustedUnlock = true;
       return null;
     })
     .finally(() => {
@@ -846,16 +946,15 @@ function unlockProjectAudio(event) {
 function setupProjectAudioUnlock() {
   const options = { capture: true, passive: true };
   window.addEventListener("pointerdown", unlockProjectAudio, options);
-  window.addEventListener("pointerup", unlockProjectAudio, options);
   window.addEventListener("touchstart", unlockProjectAudio, options);
-  window.addEventListener("touchend", unlockProjectAudio, options);
   window.addEventListener("mousedown", unlockProjectAudio, options);
   window.addEventListener("click", unlockProjectAudio, options);
-  window.addEventListener("wheel", unlockProjectAudio, options);
   window.addEventListener("keydown", unlockProjectAudio, { capture: true });
-  window.addEventListener("pageshow", unlockProjectAudio, { passive: true });
+  window.addEventListener("pageshow", markProjectAudioForTrustedRecovery, {
+    passive: true,
+  });
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) unlockProjectAudio();
+    if (!document.hidden) markProjectAudioForTrustedRecovery();
   });
 }
 
@@ -989,6 +1088,11 @@ const CELL_PADDING_RATIO = 0.07;
 const GLYPH_FONT_WEIGHT = 420;
 const FONT_SIZE_MULTIPLIER = 2.46;
 const CAMERA_MAX_DPR = IS_SAFARI_BROWSER ? 1 : 1.5;
+// WebKit's Canvas 2D text rasterization is substantially more expensive than
+// Chromium's at Retina scale. These canvases keep their CSS dimensions while
+// their compositor transforms continue at the display refresh rate.
+const INTRO_OWL_MAX_DPR = IS_SAFARI_BROWSER ? 1 : 2;
+const WORK_OWL_MAX_DPR = IS_SAFARI_BROWSER ? 1 : 2;
 const CAMERA_MASK_THRESHOLD = 220;
 const CAMERA_MASK_FEATHER = 26;
 const CAMERA_FRAME_BLEND_PRECISION = IS_SAFARI_BROWSER ? 2 : 24;
@@ -1743,7 +1847,6 @@ const cameraPlaybackState = {
 let introRevealTimeline = null;
 let introRevealScrollTrigger = null;
 let introOwlDataPromise = null;
-let deferredVisualWarmupScheduled = false;
 let capabilityCardAssetWarmupPromise = null;
 let workWaveAssetWarmupPromise = null;
 let introOwlAssemblyPending = false;
@@ -1801,6 +1904,7 @@ let workWaveImageFrames = [];
 let workWaveImages = [];
 let workWaveImageMetrics = [];
 let workWaveImageProgress = [];
+let workWaveImageRenderStates = [];
 let workWaveItemPositions = [];
 let workWaveContainerPosition = { top: 0, bottom: 0 };
 let workWaveScrollTriggers = [];
@@ -2362,16 +2466,11 @@ function chooseStartupEntry(soundEnabled, event) {
   };
 
   if (soundEnabled) {
-    try {
-      // Unity gain made Safari's unlocked Web Audio voices and the separately
-      // mixed ambient tracks feel much louder than the visual interactions.
-      setWebKitsMasterVolume(PROJECT_AUDIO_MASTER_VOLUME);
-    } catch {
-      // The site can still enter if Web Audio is unavailable.
-    }
-    primeCameraAmbientAudio();
-    primeFooterAmbientAudio();
+    // The first Web Audio call stays inside the trusted click stack. Fetching
+    // and decoding the tiny ambient file happens through that one context;
+    // there is no separate HTMLMediaElement path that can jump to unity gain.
     const unlockAttempt = unlockProjectAudio(event);
+    preloadAmbientEncodedAudio().catch(() => {});
     playClickStatePop();
     Promise.resolve(unlockAttempt).finally(finishStartupChoice);
     return;
@@ -3112,6 +3211,7 @@ function updateVisibleScrollTriggers(scrollState = null) {
       requestCameraRender();
       syncWorkWaveGalleryToScroll();
       ScrollTrigger.update();
+      window.dispatchEvent(new CustomEvent("workScrollSettled"));
     }, 120);
   }
 
@@ -3478,9 +3578,7 @@ function setCurrentPage(targetId, shouldRefresh = true) {
     cancelCameraHandoff();
     setCameraActive(false);
     if (previousPageId === "work") {
-      if (footerInteractionState !== "complete") {
-        resetFooterInteraction();
-      }
+      resetFooterInteraction();
       suspendWorkRouteScene();
     }
   }
@@ -3997,7 +4095,10 @@ function updateIntroOwlLayout() {
     return;
   }
 
-  introOwlState.dpr = Math.min(window.devicePixelRatio || 1, 2);
+  introOwlState.dpr = Math.min(
+    window.devicePixelRatio || 1,
+    INTRO_OWL_MAX_DPR,
+  );
   const width = Math.round(introOwlCanvas.clientWidth * introOwlState.dpr);
   const height = Math.round(introOwlCanvas.clientHeight * introOwlState.dpr);
 
@@ -8656,7 +8757,7 @@ function resize() {
     clearIntroOwlCanvas();
   }
 
-  if (workOwlSceneActive && workOwlSceneHasLanded) {
+  if (workOwlSceneActive && footerInteractionState === "complete") {
     setFooterInteractionFinal();
   } else if (workOwlSceneActive) {
     applyWorkOwlSceneProgress(workOwlSceneProgress);
@@ -8881,14 +8982,17 @@ function setupIntroOwlScramble() {
       return;
     }
 
+    // Preserve the most recently rendered raster while WebKit handles a fast
+    // scroll. The owl layer still moves on the compositor; only the expensive
+    // thousands-of-glyph Canvas 2D repaint waits for scroll settle.
+    if (IS_SAFARI_BROWSER && workScrollFast) return;
+
     if (introOwlState.loopStartTime === null) {
       introOwlState.loopStartTime = time;
     }
 
     const targetFps = IS_SAFARI_BROWSER
-      ? workScrollFast
-        ? 12
-        : SAFARI_INTRO_OWL_TARGET_FPS
+      ? SAFARI_INTRO_OWL_TARGET_FPS
       : INTRO_OWL_TARGET_FPS;
     const minimumFrameInterval = 1 / targetFps;
     if (time - introOwlState.lastRenderTime < minimumFrameInterval) return;
@@ -8932,7 +9036,10 @@ function setupSmoothScroll() {
     touchInertiaExponent: 1.7,
     syncTouchLerp: 0.075,
     lerp: IS_SAFARI_BROWSER ? 0.16 : 0.18,
-    smoothWheel: true,
+    // Safari already provides threaded native wheel momentum. Re-smoothing it
+    // in JavaScript makes every visual trigger wait on the main thread, which
+    // is also responsible for the glyph canvases.
+    smoothWheel: !IS_SAFARI_BROWSER,
     // Native WebKit touch momentum is already excellent and avoids a second
     // main-thread scroll authority on iPhone/iPad Safari.
     syncTouch: !IS_SAFARI_BROWSER,
@@ -10482,7 +10589,6 @@ function setFooterInteractionFinal() {
   footerInteractionTimeline?.kill();
   footerInteractionTimeline = null;
   setFooterInteractionState("complete");
-  startFooterAmbientOutro();
   resetFooterInteractionVisuals({ includeOwl: false });
   setFooterWordsFinal();
 
@@ -10686,10 +10792,10 @@ function playFooterInteraction() {
     return;
   }
 
-  const hasCompleted =
-    footerInteractionState === "complete" ||
-    workOwlSceneHasLanded ||
-    workOwlLayer?.dataset.workOwlHasEntered === "true";
+  // This state is the sole authority for the authored footer sequence. The
+  // owl renderer can land independently and must never suppress the words,
+  // glyph burst, glow, or socials timeline.
+  const hasCompleted = footerInteractionState === "complete";
 
   if (hasCompleted) {
     setFooterInteractionState("complete");
@@ -10770,7 +10876,7 @@ function playFooterInteraction() {
 }
 
 function resetFooterInteraction() {
-  stopFooterAmbientOutro();
+  beginFooterAmbientEpoch();
   clearFooterInteractionCompletionFallback();
   footerInteractionTimeline?.kill();
   footerInteractionTimeline = null;
@@ -11067,7 +11173,10 @@ function updateWorkOwlCanvasSize() {
     return;
   }
 
-  workOwlRenderState.dpr = Math.min(window.devicePixelRatio || 1, 2);
+  workOwlRenderState.dpr = Math.min(
+    window.devicePixelRatio || 1,
+    WORK_OWL_MAX_DPR,
+  );
   const width = Math.max(
     1,
     Math.round(workOwlCanvas.clientWidth * workOwlRenderState.dpr),
@@ -11548,10 +11657,12 @@ function setupWorkOwlRenderLoop() {
       return;
     }
 
+    // Keep the last footer owl raster composited during a fast Safari scroll;
+    // resume its internal frame animation as soon as scrolling settles.
+    if (IS_SAFARI_BROWSER && workScrollFast) return;
+
     const targetFps = IS_SAFARI_BROWSER
-      ? workScrollFast
-        ? 12
-        : footerInteractionState === "playing"
+      ? footerInteractionState === "playing"
         ? SAFARI_WORK_OWL_ACTIVE_TARGET_FPS
         : SAFARI_WORK_OWL_SETTLED_TARGET_FPS
       : WORK_OWL_TARGET_FPS;
@@ -11843,6 +11954,25 @@ function setupWorkOwlScene() {
 
   resetFooterInteraction();
 
+  const reconcileFooterInteraction = () => {
+    if (
+      document.body.dataset.currentPage !== "work" ||
+      !isFooterSceneVisible()
+    ) {
+      return;
+    }
+
+    if (footerInteractionState === "complete") {
+      setWorkOwlSceneActive(true, true);
+      return;
+    }
+
+    // A first fast arrival can occur while startup/intro state is finishing.
+    // Every trigger callback retries this idempotent start, so that transient
+    // frame cannot leave the footer permanently blank.
+    playFooterInteraction();
+  };
+
   workOwlScenePresenceScrollTrigger = ScrollTrigger.create({
     trigger: workOwlScene,
     // Begin as the sticky footer enters the viewport. The first half of the
@@ -11851,66 +11981,29 @@ function setupWorkOwlScene() {
     start: "top bottom",
     end: "bottom bottom",
     invalidateOnRefresh: true,
-    onEnter(self) {
-      if (self.progress > 0.72 && (workScrollFast || Math.abs(self.getVelocity()) > 1600)) {
-        setFooterInteractionFinal();
-        return;
-      }
-      playFooterInteraction();
-    },
-    onEnterBack: playFooterInteraction,
-    onUpdate(self) {
-      if (document.body.dataset.currentPage !== "work") return;
-
-      // `bottom bottom` is the maximum document scroll, so Safari can reach
-      // progress 1 without ever firing onLeave. The final footer state must be
-      // derived from absolute progress, not from dwelling for 4.5 seconds.
-      if (
-        self.progress >= 0.998 ||
-        (
-          self.progress >= 0.76 &&
-          (workScrollFast || Math.abs(self.getVelocity()) > 1800)
-        )
-      ) {
-        if (footerInteractionState !== "complete") {
-          setFooterInteractionFinal();
-        }
-      }
-    },
+    onEnter: reconcileFooterInteraction,
+    onEnterBack: reconcileFooterInteraction,
+    onUpdate: reconcileFooterInteraction,
     onLeave() {
-      if (document.body.dataset.currentPage !== "work") return;
-
-      // An instant jump can cross both trigger boundaries in one update. At
-      // the document bottom the footer is still visible, so start (or resume)
-      // the sequence even though ScrollTrigger now reports progress 1.
-      if (isFooterSceneVisible()) {
-        setFooterInteractionFinal();
-      }
+      // `bottom bottom` is the maximum scroll position. The sticky footer is
+      // still visible here, so its time-based choreography must keep playing.
+      reconcileFooterInteraction();
     },
     onLeaveBack() {
       if (document.body.dataset.currentPage !== "work") return;
-      if (footerInteractionState !== "complete") {
-        resetFooterInteraction();
-      }
+      resetFooterInteraction();
       suspendWorkRouteScene();
     },
     onRefresh(self) {
       if (document.body.dataset.currentPage !== "work") return;
 
-      if (
-        self.progress >= 0.998 && isFooterSceneVisible()
-      ) {
-        setFooterInteractionFinal();
-        return;
-      }
-
-      if (self.isActive) {
-        playFooterInteraction();
+      if (isFooterSceneVisible()) {
+        reconcileFooterInteraction();
         return;
       }
 
       if (self.progress <= 0) {
-        if (footerInteractionState !== "complete") {
+        if (footerInteractionState !== "idle") {
           resetFooterInteraction();
         }
         suspendWorkRouteScene();
@@ -11941,11 +12034,26 @@ function setWorkWaveStaticFrame() {
     const translateX =
       (workWaveViewportWidth - imageWidth) / 2 +
       workWaveViewportWidth * WORK_WAVE_RIGHT_SHIFT_RATIO;
-    imageFrame.style.transform = `translate3d(${translateX}px, 0px, 0) scaleX(1)`;
+    const frameTransform = `translate3d(${translateX}px, 0px, 0) scaleX(1)`;
+    const previousState = workWaveImageRenderStates[index];
+    if (
+      previousState?.mode === "static" &&
+      previousState.frameTransform === frameTransform
+    ) {
+      return;
+    }
+
+    imageFrame.style.transform = frameTransform;
     image.style.transform = "scaleX(1)";
     imageFrame.style.opacity = "1";
     imageFrame.style.visibility = "visible";
     imageFrame.classList.add("is-render-active");
+    workWaveImageRenderStates[index] = {
+      mode: "static",
+      frameTransform,
+      imageTransform: "scaleX(1)",
+      isVisible: true,
+    };
   });
 }
 
@@ -12002,12 +12110,26 @@ function updateWorkWaveImageFrame(
   progress,
   metric,
   forceVisible = false,
+  renderIndex = -1,
 ) {
   const { base, flow, detail } = WORK_WAVE_CONFIG.waves;
   const viewportWidth = workWaveViewportWidth || window.innerWidth;
   const viewportHeight = workWaveViewportHeight || window.innerHeight;
   const imageWidth = metric?.width ?? 0;
   const imageHeight = metric?.height ?? 0;
+  const previousState = workWaveImageRenderStates[renderIndex];
+
+  if (
+    previousState?.mode === "animated" &&
+    previousState.progress === progress &&
+    previousState.forceVisible === forceVisible &&
+    previousState.viewportWidth === viewportWidth &&
+    previousState.viewportHeight === viewportHeight &&
+    previousState.imageWidth === imageWidth &&
+    previousState.imageHeight === imageHeight
+  ) {
+    return;
+  }
 
   const baseWave = Math.sin(
     normalizedIndex * base.freq + (1 - progress) * base.speed + base.phase,
@@ -12040,13 +12162,34 @@ function updateWorkWaveImageFrame(
     Math.pow(centerOffset, WORK_WAVE_CONFIG.clipPower) * WORK_WAVE_CONFIG.clipMax;
   const cropScale = Math.max(0.55, 1 - clipAmount * 0.02);
   const isVisible = forceVisible || (progress > 0.001 && progress < 0.999);
-
-  imageFrame.style.transform =
+  const frameTransform =
     `translate3d(${translateX}px, ${translateY}px, 0) scaleX(${cropScale})`;
-  image.style.transform = `scaleX(${1 / cropScale})`;
-  imageFrame.style.opacity = isVisible ? "1" : "0";
-  imageFrame.style.visibility = isVisible ? "visible" : "hidden";
-  imageFrame.classList.toggle("is-render-active", isVisible);
+  const imageTransform = `scaleX(${1 / cropScale})`;
+
+  if (previousState?.frameTransform !== frameTransform) {
+    imageFrame.style.transform = frameTransform;
+  }
+  if (previousState?.imageTransform !== imageTransform) {
+    image.style.transform = imageTransform;
+  }
+  if (previousState?.isVisible !== isVisible) {
+    imageFrame.style.opacity = isVisible ? "1" : "0";
+    imageFrame.style.visibility = isVisible ? "visible" : "hidden";
+    imageFrame.classList.toggle("is-render-active", isVisible);
+  }
+
+  workWaveImageRenderStates[renderIndex] = {
+    mode: "animated",
+    progress,
+    forceVisible,
+    viewportWidth,
+    viewportHeight,
+    imageWidth,
+    imageHeight,
+    frameTransform,
+    imageTransform,
+    isVisible,
+  };
 }
 
 function syncWorkWaveGalleryToScroll(direction = 1, velocity = workScrollVelocity) {
@@ -12107,6 +12250,7 @@ function syncWorkWaveGalleryToScroll(direction = 1, velocity = workScrollVelocit
       workWaveImageProgress[index],
       workWaveImageMetrics[index],
       galleryVisible && index === canonicalIndex,
+      index,
     );
   });
 
@@ -12210,6 +12354,7 @@ function setupWorkWaveGallery() {
   workWaveImages = [];
   workWaveImageMetrics = [];
   workWaveImageProgress = Array(WORK_WAVE_TOTAL_IMAGES).fill(0);
+  workWaveImageRenderStates = Array(WORK_WAVE_TOTAL_IMAGES).fill(null);
   workWaveItemPositions = [];
   workWaveContainerPosition = { top: 0, bottom: 0 };
   workWaveActiveIndex = -1;
@@ -12624,6 +12769,12 @@ function setupCapabilityCards() {
     revealTweens: [],
   }));
   const runnerIndexes = [0, 1];
+  let capabilityGlyphBurstRetry = null;
+
+  const cancelCapabilityGlyphBurstRetry = () => {
+    capabilityGlyphBurstRetry?.kill?.();
+    capabilityGlyphBurstRetry = null;
+  };
 
   const killBlueRunnerState = (cardIndex) => {
     const state = blueRunnerStates[cardIndex];
@@ -12647,6 +12798,7 @@ function setupCapabilityCards() {
   };
 
   const cleanupCapabilityCards = () => {
+    cancelCapabilityGlyphBurstRetry();
     document.body.classList.remove("capability-cards-active");
     cleanupBlueRunners();
     stopCapabilityGlyphBurst();
@@ -12983,8 +13135,40 @@ function setupCapabilityCards() {
 
       let previousCardsProgress = 0;
       let glyphBurstArmed = true;
+      let glyphBurstPending = false;
       let cardHeights = capabilityCards.map((card) => card.offsetHeight);
       let cardsViewportHeight = window.innerHeight;
+
+      const attemptCapabilityGlyphBurst = () => {
+        cancelCapabilityGlyphBurstRetry();
+        if (!glyphBurstPending || !glyphBurstArmed) return;
+
+        const sectionBounds = capabilityCardsSection.getBoundingClientRect();
+        const sectionIsVisible =
+          sectionBounds.bottom > 0 && sectionBounds.top < window.innerHeight;
+        if (!sectionIsVisible) {
+          glyphBurstPending = false;
+          stopCapabilityGlyphBurst();
+          return;
+        }
+
+        if (workScrollFast) {
+          capabilityGlyphBurstRetry = gsap.delayedCall(
+            0.14,
+            attemptCapabilityGlyphBurst,
+          );
+          return;
+        }
+
+        glyphBurstPending = false;
+        glyphBurstArmed = false;
+        playCapabilityGlyphBurst();
+      };
+
+      const handleWorkScrollSettled = () => {
+        if (glyphBurstPending) attemptCapabilityGlyphBurst();
+      };
+      window.addEventListener("workScrollSettled", handleWorkScrollSettled);
 
       const refreshCardMetrics = () => {
         cardsViewportHeight = window.innerHeight;
@@ -12994,15 +13178,15 @@ function setupCapabilityCards() {
       const updateCards = (progress) => {
         if (progress <= CAPABILITY_GLYPH_BURST_TRIGGER_PROGRESS - 0.055) {
           glyphBurstArmed = true;
+          glyphBurstPending = false;
+          cancelCapabilityGlyphBurstRetry();
         } else if (
           glyphBurstArmed &&
           previousCardsProgress < CAPABILITY_GLYPH_BURST_TRIGGER_PROGRESS &&
           progress >= CAPABILITY_GLYPH_BURST_TRIGGER_PROGRESS
         ) {
-          glyphBurstArmed = false;
-          if (!workScrollFast) {
-            playCapabilityGlyphBurst();
-          }
+          glyphBurstPending = true;
+          attemptCapabilityGlyphBurst();
         }
         previousCardsProgress = progress;
 
@@ -13114,10 +13298,15 @@ function setupCapabilityCards() {
           updateCards(1);
           document.body.classList.remove("capability-cards-active");
           cleanupBlueRunners();
-          stopCapabilityGlyphBurst();
+          // The section remains visible for one viewport after its sticky
+          // range ends. Let a queued/playing burst finish in that visible
+          // tail instead of cancelling it at the ScrollTrigger boundary.
+          if (glyphBurstPending) attemptCapabilityGlyphBurst();
         },
         onLeaveBack: () => {
           updateCards(0);
+          glyphBurstPending = false;
+          cancelCapabilityGlyphBurstRetry();
           document.body.classList.remove("capability-cards-active");
           cleanupBlueRunners();
           stopCapabilityGlyphBurst();
@@ -13131,12 +13320,20 @@ function setupCapabilityCards() {
           );
           if (!self.isActive) {
             cleanupBlueRunners();
-            stopCapabilityGlyphBurst();
+            const bounds = capabilityCardsSection.getBoundingClientRect();
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) {
+              glyphBurstPending = false;
+              cancelCapabilityGlyphBurstRetry();
+              stopCapabilityGlyphBurst();
+            }
           }
         },
       });
 
-      return cleanupCapabilityCards;
+      return () => {
+        window.removeEventListener("workScrollSettled", handleWorkScrollSettled);
+        cleanupCapabilityCards();
+      };
     },
   );
 }
@@ -14955,6 +15152,32 @@ function waitForCapabilityCardImage(image) {
   });
 }
 
+async function decodeImageAsset(image) {
+  await waitForCapabilityCardImage(image);
+  if (typeof image.decode === "function" && image.naturalWidth > 0) {
+    await image.decode().catch(() => {});
+  }
+  // Yield between texture uploads so WebKit never receives one large decode
+  // completion burst on the frame that first reveals a section.
+  await new Promise((resolve) => window.requestAnimationFrame(resolve));
+}
+
+async function decodeImageAssets(images, concurrency = 2) {
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, images.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < images.length) {
+      const image = images[nextIndex];
+      nextIndex += 1;
+      if (image instanceof HTMLImageElement) {
+        await decodeImageAsset(image);
+      }
+    }
+  });
+
+  await Promise.all(workers);
+}
+
 function warmCapabilityCardAssets() {
   if (capabilityCardAssetWarmupPromise !== null) {
     return capabilityCardAssetWarmupPromise;
@@ -14963,19 +15186,8 @@ function warmCapabilityCardAssets() {
   capabilityCardAssetWarmupPromise = (async () => {
     capabilityCardImages.forEach((image) => {
       image.loading = "eager";
-      image.setAttribute("fetchpriority", "auto");
     });
-
-    await Promise.all(capabilityCardImages.map(waitForCapabilityCardImage));
-
-    // Decode one image per frame so Safari never has to decode every 3D card
-    // face synchronously when the sticky deck first enters the viewport.
-    for (const image of capabilityCardImages) {
-      if (typeof image.decode === "function" && image.naturalWidth > 0) {
-        await image.decode().catch(() => {});
-      }
-      await new Promise((resolve) => window.requestAnimationFrame(resolve));
-    }
+    await decodeImageAssets(capabilityCardImages, 2);
   })();
 
   return capabilityCardAssetWarmupPromise;
@@ -14989,68 +15201,52 @@ function warmWorkWaveAssets() {
   workWaveAssetWarmupPromise = (async () => {
     workWaveImages.forEach((image) => {
       image.loading = "eager";
-      image.setAttribute("fetchpriority", "auto");
     });
-
-    await Promise.all(workWaveImages.map(waitForCapabilityCardImage));
-    for (const image of workWaveImages) {
-      if (typeof image.decode === "function" && image.naturalWidth > 0) {
-        await image.decode().catch(() => {});
-      }
-      await new Promise((resolve) => window.requestAnimationFrame(resolve));
-    }
+    await decodeImageAssets(workWaveImages, 2);
   })();
 
   return workWaveAssetWarmupPromise;
 }
 
-function prewarmDeferredCanvasEffects() {
+function waitForVisualWarmupOpportunity() {
+  if (!startupExperienceReady || !workScrollFast) {
+    return new Promise((resolve) => window.requestAnimationFrame(resolve));
+  }
+
+  return new Promise((resolve) => {
+    let checkTimer = 0;
+    const finish = () => {
+      window.clearTimeout(checkTimer);
+      if (workScrollFast) {
+        checkTimer = window.setTimeout(finish, 120);
+        return;
+      }
+
+      window.removeEventListener("workScrollSettled", finish);
+      window.requestAnimationFrame(resolve);
+    };
+    window.addEventListener("workScrollSettled", finish, { once: true });
+    checkTimer = window.setTimeout(finish, 140);
+  });
+}
+
+async function prewarmDeferredCanvasEffects() {
+  await waitForVisualWarmupOpportunity();
   capabilityGlyphBurstState.maxDpr = CAPABILITY_GLYPH_BURST_MAX_DPR;
   buildGlyphBurst(capabilityGlyphBurstState);
   clearGlyphBurst(capabilityGlyphBurstState);
 
+  await waitForVisualWarmupOpportunity();
+
   prepareFooterGlyphBurst();
   clearGlyphBurst(footerGlyphBurstState);
+
+  await waitForVisualWarmupOpportunity();
 
   if (isIntroOwlDataReady() && !workOwlRenderState.rendered) {
     updateWorkOwlCanvasSize();
     renderWorkOwlFrame(getWorkOwlInitialFramePosition());
   }
-}
-
-function scheduleDeferredVisualWarmup() {
-  if (deferredVisualWarmupScheduled) return;
-
-  deferredVisualWarmupScheduled = true;
-  // Start network and decode work as soon as the startup cover is released;
-  // requestIdleCallback can arrive after a fast user has already reached the
-  // gallery or cards on Safari.
-  warmCapabilityCardAssets().catch((error) => {
-    console.error("Unable to warm the capability card assets.", error);
-  });
-  warmWorkWaveAssets().catch((error) => {
-    console.error("Unable to warm the gallery assets.", error);
-  });
-
-  const warmCanvasEffects = () => {
-    loadIntroOwlData()
-      .then(() => new Promise((resolve) => window.requestAnimationFrame(resolve)))
-      .then(() => {
-        if (activePageId === "work") {
-          prewarmDeferredCanvasEffects();
-        }
-      })
-      .catch((error) => {
-        console.error("Unable to warm the deferred owl visuals.", error);
-      });
-  };
-
-  if ("requestIdleCallback" in window) {
-    window.requestIdleCallback(warmCanvasEffects, { timeout: 1200 });
-    return;
-  }
-
-  window.setTimeout(warmCanvasEffects, 320);
 }
 
 function settleWithTimeout(promise, timeoutMs) {
@@ -15430,6 +15626,20 @@ async function boot() {
   setupIntroOwlScramble();
   setupWorkOwlRenderLoop();
 
+  // Begin texture decode and heavy glyph preparation while the startup cover
+  // is still authoritative. A quick first scroll must never be the event that
+  // pays these one-time costs.
+  const capabilityAssetsReady = warmCapabilityCardAssets().catch((error) => {
+    console.error("Unable to warm the capability card assets.", error);
+  });
+  warmWorkWaveAssets().catch((error) => {
+    console.error("Unable to warm the gallery assets.", error);
+  });
+  const canvasEffectsReady = Promise.all([
+    introOwlPreload,
+    capabilityAssetsReady,
+  ]).then(() => prewarmDeferredCanvasEffects());
+
   window.addEventListener("resize", handleWindowResize, { passive: true });
   window.visualViewport?.addEventListener("resize", handleVisualViewportResize, {
     passive: true,
@@ -15440,13 +15650,8 @@ async function boot() {
   resetRouteScrollToTop();
   ScrollTrigger.update();
   await startupEntryChoice;
-  warmCapabilityCardAssets().catch((error) => {
-    console.error("Unable to warm the capability card assets.", error);
-  });
-  warmWorkWaveAssets().catch((error) => {
-    console.error("Unable to warm the gallery assets.", error);
-  });
   await introOwlPreload;
+  await settleWithTimeout(canvasEffectsReady, 1600);
   resetIntroTyperReveal();
   resetRouteScrollToTop();
   ScrollTrigger.update();
@@ -15458,8 +15663,12 @@ async function boot() {
   });
   resetRouteScrollToTop();
   startupExperienceReady = true;
-  ScrollTrigger.update();
-  scheduleDeferredVisualWarmup();
+  // The startup shell changes overflow and viewport ownership. Refreshing on
+  // the next paint gives both Lenis and ScrollTrigger post-unlock geometry.
+  await new Promise((resolve) => window.requestAnimationFrame(resolve));
+  smoothScroller?.resize?.();
+  ScrollTrigger.refresh();
+  syncWorkWaveGalleryToScroll();
 }
 
 boot();
