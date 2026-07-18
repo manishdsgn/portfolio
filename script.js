@@ -2041,7 +2041,9 @@ let workOwlSceneEnterTween = null;
 let footerInteractionTimeline = null;
 let footerInteractionTimelinePrepared = false;
 let footerInteractionCompletionFallback = null;
+let footerInteractionStartRetry = null;
 let footerInteractionState = "idle";
+let workOwlSceneEntryY = Number.POSITIVE_INFINITY;
 let aboutQuoteTimeline = null;
 let aboutStoryObserver = null;
 let footerCopyResetTimer = 0;
@@ -3370,6 +3372,17 @@ function runWorkRenderScheduler(time, deltaTime) {
   if (criticalSceneSyncPending) {
     criticalSceneSyncPending = false;
     syncCapabilityCardsFromScroll?.();
+    syncFooterFromScroll?.();
+  }
+
+  // WebKit can coalesce an entire fast wheel gesture into a final scroll
+  // position without delivering the intermediate ScrollTrigger boundary.
+  // The cached threshold avoids a per-frame layout read while guaranteeing
+  // that the footer's one-shot entrance receives its first handoff.
+  if (
+    footerInteractionState === "idle" &&
+    window.scrollY >= workOwlSceneEntryY
+  ) {
     syncFooterFromScroll?.();
   }
 
@@ -7528,6 +7541,8 @@ function setupNativeScrollTracking() {
   window.addEventListener("scroll", () => {
     if (scrollEngineMode !== "native") {
       previousScrollY = window.scrollY;
+      scheduleCriticalSceneSync();
+      gsap.ticker.wake();
       return;
     }
 
@@ -9414,6 +9429,11 @@ function setupSmoothScroll() {
   gsap.ticker.lagSmoothing(0);
 
   window.addEventListener("wheel", armLenisInputWatchdog, { passive: true });
+  // Safari may commit a native scroll offset before Lenis emits its next
+  // interpolated update. Keep Lenis authoritative for motion, but use the
+  // native event to wake the single render scheduler and reconcile critical
+  // sticky scenes on that same ticker.
+  setupNativeScrollTracking();
   smoothScrollLockObserver?.disconnect();
   lastObservedScrollLockState = !shouldResumeSmoothScroll();
   smoothScrollLockObserver = new MutationObserver(() => {
@@ -10956,6 +10976,11 @@ function clearFooterInteractionCompletionFallback() {
   footerInteractionCompletionFallback = null;
 }
 
+function clearFooterInteractionStartRetry() {
+  footerInteractionStartRetry?.kill();
+  footerInteractionStartRetry = null;
+}
+
 function isFooterInteractionStartBlocked() {
   const root = document.documentElement;
 
@@ -10976,6 +11001,7 @@ function isFooterSceneVisible() {
 }
 
 function setFooterInteractionFinal() {
+  clearFooterInteractionStartRetry();
   clearFooterInteractionCompletionFallback();
   footerInteractionTimeline?.kill();
   footerInteractionTimeline = null;
@@ -11231,7 +11257,26 @@ function playFooterInteraction() {
   // lock is pinning the page back to its reveal. Starting in that transient
   // frame makes the footer finish off-screen, so only an unlocked first
   // arrival is allowed to create the timeline.
-  if (isFooterInteractionStartBlocked()) return;
+  if (isFooterInteractionStartBlocked()) {
+    // Safari can cross the footer trigger while the startup/intro lock is
+    // clearing, then stop producing scroll events. Retry while the footer is
+    // actually visible so its first entrance cannot remain stranded in idle.
+    if (footerInteractionStartRetry === null) {
+      footerInteractionStartRetry = gsap.delayedCall(0.12, () => {
+        footerInteractionStartRetry = null;
+        if (
+          document.body.dataset.currentPage === "work" &&
+          footerInteractionState === "idle" &&
+          isFooterSceneVisible()
+        ) {
+          playFooterInteraction();
+        }
+      });
+    }
+    return;
+  }
+
+  clearFooterInteractionStartRetry();
 
   if (!isIntroOwlDataReady()) {
     if (!workOwlSceneEnterPending) {
@@ -11296,6 +11341,7 @@ function playFooterInteraction() {
 
 function resetFooterInteraction() {
   beginFooterAmbientEpoch();
+  clearFooterInteractionStartRetry();
   clearFooterInteractionCompletionFallback();
   footerInteractionTimeline?.kill();
   footerInteractionTimeline = null;
@@ -12456,6 +12502,7 @@ function setupWorkOwlScene() {
   workOwlSceneProgress = 0;
   workOwlSceneEnterPending = false;
   syncFooterFromScroll = null;
+  workOwlSceneEntryY = Number.POSITIVE_INFINITY;
   setWorkOwlSceneLanded(false);
   setupFooterCopyEmail();
 
@@ -12475,6 +12522,15 @@ function setupWorkOwlScene() {
   workOwlRenderState.currentScrambleBucket = -1;
 
   resetFooterInteraction();
+
+  const updateWorkOwlSceneEntryY = () => {
+    workOwlSceneEntryY = Math.max(
+      0,
+      workOwlScene.offsetTop - window.innerHeight,
+    );
+  };
+
+  updateWorkOwlSceneEntryY();
 
   const reconcileFooterInteraction = () => {
     if (document.body.dataset.currentPage !== "work") return;
@@ -12524,6 +12580,8 @@ function setupWorkOwlScene() {
     },
     onRefresh(self) {
       if (document.body.dataset.currentPage !== "work") return;
+
+      updateWorkOwlSceneEntryY();
 
       if (isFooterSceneVisible()) {
         reconcileFooterInteraction();
