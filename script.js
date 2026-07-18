@@ -143,13 +143,35 @@ const introHighlightSwooshVoices = [];
 let pageTransitionNoiseVoice = null;
 let galleryPopLastPlayedAt = Number.NEGATIVE_INFINITY;
 let capabilityTapLastPlayedAt = Number.NEGATIVE_INFINITY;
+const pendingMediaSeekHandlers = new WeakMap();
 
 function safeSetMediaTime(media, time) {
+  const previousHandler = pendingMediaSeekHandlers.get(media);
+  if (previousHandler) {
+    media.removeEventListener("loadedmetadata", previousHandler);
+    pendingMediaSeekHandlers.delete(media);
+  }
+
+  const applySeek = () => {
+    pendingMediaSeekHandlers.delete(media);
+    try {
+      media.currentTime = time;
+    } catch {
+      // A media error should not block the visual experience.
+    }
+  };
+
+  if (media.readyState === HTMLMediaElement.HAVE_NOTHING) {
+    pendingMediaSeekHandlers.set(media, applySeek);
+    media.addEventListener("loadedmetadata", applySeek, { once: true });
+    return;
+  }
+
   try {
     media.currentTime = time;
   } catch {
-    // Safari can reject a seek until metadata exists; the next play attempt
-    // will retry from the requested cue point.
+    pendingMediaSeekHandlers.set(media, applySeek);
+    media.addEventListener("loadedmetadata", applySeek, { once: true });
   }
 }
 
@@ -1779,6 +1801,8 @@ let workWaveImageFrames = [];
 let workWaveImages = [];
 let workWaveImageMetrics = [];
 let workWaveImageProgress = [];
+let workWaveItemPositions = [];
+let workWaveContainerPosition = { top: 0, bottom: 0 };
 let workWaveScrollTriggers = [];
 let workWaveViewportWidth = 0;
 let workWaveViewportHeight = 0;
@@ -10458,6 +10482,7 @@ function setFooterInteractionFinal() {
   footerInteractionTimeline?.kill();
   footerInteractionTimeline = null;
   setFooterInteractionState("complete");
+  startFooterAmbientOutro();
   resetFooterInteractionVisuals({ includeOwl: false });
   setFooterWordsFinal();
 
@@ -11924,6 +11949,24 @@ function setWorkWaveStaticFrame() {
   });
 }
 
+function measureWorkWaveGalleryGeometry() {
+  if (!(workWaveImagesContainer instanceof HTMLElement)) return;
+
+  const scrollTop = window.scrollY;
+  const containerRect = workWaveImagesContainer.getBoundingClientRect();
+  workWaveContainerPosition = {
+    top: containerRect.top + scrollTop,
+    bottom: containerRect.bottom + scrollTop,
+  };
+  workWaveItemPositions = workWaveImageItems.map((item) => {
+    const rect = item.getBoundingClientRect();
+    return {
+      top: rect.top + scrollTop,
+      height: rect.height,
+    };
+  });
+}
+
 function updateWorkWaveImageSizes() {
   if (activePageId !== "work" || workWaveImageItems.length === 0) return;
 
@@ -11944,6 +11987,8 @@ function updateWorkWaveImageSizes() {
     imageItem.style.height = `${height}px`;
     workWaveImageMetrics[index] = { width, height };
   });
+
+  measureWorkWaveGalleryGeometry();
 
   if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
     setWorkWaveStaticFrame();
@@ -12013,25 +12058,30 @@ function syncWorkWaveGalleryToScroll(direction = 1, velocity = workScrollVelocit
     return;
   }
 
-  // Read every bound first, then write every transform. A single canonical
-  // renderer means a coalesced Safari scroll event cannot skip an item's
-  // trigger and leave the whole gallery blank.
+  // Geometry is cached during refresh/resize. Scroll frames only perform
+  // arithmetic and compositor writes, so Safari never pays for 13 live rect
+  // reads while the gallery is moving.
   const viewportHeight = workWaveViewportHeight || window.innerHeight;
-  const itemRects = workWaveImageItems.map((item) => item.getBoundingClientRect());
-  const containerRect = workWaveImagesContainer.getBoundingClientRect();
-  const galleryVisible = containerRect.bottom > 0 && containerRect.top < viewportHeight;
+  const scrollTop = window.scrollY;
+  const galleryVisible =
+    workWaveContainerPosition.bottom > scrollTop &&
+    workWaveContainerPosition.top < scrollTop + viewportHeight;
   let canonicalIndex = -1;
   let canonicalDistance = Number.POSITIVE_INFINITY;
 
-  itemRects.forEach((rect, index) => {
+  workWaveItemPositions.forEach((position, index) => {
+    const rectTop = position.top - scrollTop;
     const progress = clamp(
-      (viewportHeight - rect.top) / Math.max(1, viewportHeight + rect.height),
+      (viewportHeight - rectTop) /
+        Math.max(1, viewportHeight + position.height),
       0,
       1,
     );
     workWaveImageProgress[index] = progress;
 
-    const distance = Math.abs(rect.top + rect.height * 0.5 - viewportHeight * 0.5);
+    const distance = Math.abs(
+      rectTop + position.height * 0.5 - viewportHeight * 0.5,
+    );
     if (distance < canonicalDistance) {
       canonicalDistance = distance;
       canonicalIndex = index;
@@ -12160,6 +12210,8 @@ function setupWorkWaveGallery() {
   workWaveImages = [];
   workWaveImageMetrics = [];
   workWaveImageProgress = Array(WORK_WAVE_TOTAL_IMAGES).fill(0);
+  workWaveItemPositions = [];
+  workWaveContainerPosition = { top: 0, bottom: 0 };
   workWaveActiveIndex = -1;
   workWaveImagesContainer.textContent = "";
   setupWorkWaveCaption();
