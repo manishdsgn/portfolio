@@ -1,7 +1,6 @@
 import gsap from "gsap";
 import Lenis from "lenis";
 import "lenis/dist/lenis.css";
-import { injectSpeedInsights } from "@vercel/speed-insights";
 import { slotText } from "slot-text";
 import "slot-text/style.css";
 import {
@@ -26,7 +25,17 @@ import { SplitText } from "gsap/SplitText";
 // local animation profiling free of observability requests and collect from
 // both Vercel preview and production builds.
 if (import.meta.env.PROD) {
-  injectSpeedInsights();
+  const startSpeedInsights = () => {
+    import("@vercel/speed-insights")
+      .then(({ injectSpeedInsights }) => injectSpeedInsights())
+      .catch(() => {});
+  };
+
+  if (document.readyState === "complete") {
+    window.setTimeout(startSpeedInsights, 0);
+  } else {
+    window.addEventListener("load", startSpeedInsights, { once: true });
+  }
 }
 
 gsap.registerPlugin(ScrollTrigger, CustomEase, SplitText);
@@ -1961,6 +1970,7 @@ let introRevealScrollTrigger = null;
 let introOwlDataPromise = null;
 let capabilityCardAssetWarmupPromise = null;
 let workWaveAssetWarmupPromise = null;
+let postStartupAssetWarmupTimer = 0;
 let introOwlAssemblyPending = false;
 let introOwlAssemblyTimeline = null;
 let introOwlExitTimeline = null;
@@ -16188,36 +16198,61 @@ async function decodeImageAssets(images, concurrency = 2) {
   await Promise.all(workers);
 }
 
-function warmCapabilityCardAssets() {
+function warmCapabilityCardAssets(priority = "auto") {
+  capabilityCardImages.forEach((image) => {
+    image.loading = "eager";
+    image.fetchPriority = priority;
+  });
+
   if (capabilityCardAssetWarmupPromise !== null) {
     return capabilityCardAssetWarmupPromise;
   }
 
   capabilityCardAssetWarmupPromise = (async () => {
-    capabilityCardImages.forEach((image) => {
-      image.loading = "eager";
-      image.fetchPriority = "high";
-    });
     await decodeImageAssets(capabilityCardImages, 2);
   })();
 
   return capabilityCardAssetWarmupPromise;
 }
 
-function warmWorkWaveAssets() {
+function warmWorkWaveAssets(priority = "auto") {
+  workWaveImages.forEach((image) => {
+    image.loading = "eager";
+    image.fetchPriority = priority;
+  });
+
   if (workWaveAssetWarmupPromise !== null) {
     return workWaveAssetWarmupPromise;
   }
 
   workWaveAssetWarmupPromise = (async () => {
-    workWaveImages.forEach((image) => {
-      image.loading = "eager";
-      image.fetchPriority = "auto";
-    });
     await decodeImageAssets(workWaveImages, 2);
   })();
 
   return workWaveAssetWarmupPromise;
+}
+
+function beginPostStartupAssetWarmup(priority = "auto") {
+  window.clearTimeout(postStartupAssetWarmupTimer);
+  postStartupAssetWarmupTimer = 0;
+
+  return Promise.all([
+    warmCapabilityCardAssets(priority),
+    warmWorkWaveAssets(priority),
+  ]);
+}
+
+function schedulePostStartupAssetWarmup() {
+  window.clearTimeout(postStartupAssetWarmupTimer);
+  // Keep the startup logo, type and camera data uncontested for the first
+  // paint. The deterministic delay still begins card/gallery decoding while
+  // the entry screen is visible, well before either section can be reached.
+  postStartupAssetWarmupTimer = window.setTimeout(() => {
+    postStartupAssetWarmupTimer = 0;
+    beginPostStartupAssetWarmup("auto").catch((error) => {
+      console.error("Unable to warm post-startup image assets.", error);
+    });
+  }, 900);
 }
 
 function waitForVisualWarmupOpportunity() {
@@ -16339,15 +16374,16 @@ async function waitForCriticalFonts() {
 }
 
 async function loadFrameData() {
-  const metadata = await fetch("/frame-data.json").then((response) => response.json());
+  const metadata = await fetch("/frame-data.json", { priority: "low" })
+    .then((response) => response.json());
   const [densityBuffer, silhouetteBuffer] = await Promise.all([
-    fetch("/frame-density.bin").then((response) => {
+    fetch("/frame-density.bin", { priority: "low" }).then((response) => {
       if (!response.ok) {
         throw new Error("Unable to load frame-density.bin");
       }
       return response.arrayBuffer();
     }),
-    fetch("/frame-silhouette.bin").then((response) => {
+    fetch("/frame-silhouette.bin", { priority: "low" }).then((response) => {
       if (!response.ok) {
         throw new Error("Unable to load frame-silhouette.bin");
       }
@@ -16389,26 +16425,26 @@ async function loadIntroOwlData() {
   if (introOwlDataPromise !== null) return introOwlDataPromise;
 
   introOwlDataPromise = (async () => {
-    const metadata = await fetch("/intro-owl-data.json").then((response) => {
+    const metadata = await fetch("/intro-owl-data.json", { priority: "low" }).then((response) => {
       if (!response.ok) {
         throw new Error("Unable to load intro-owl-data.json");
       }
       return response.json();
     });
     const [lumaBuffer, edgeBuffer, maskBuffer] = await Promise.all([
-      fetch(metadata.lumaFile).then((response) => {
+      fetch(metadata.lumaFile, { priority: "low" }).then((response) => {
         if (!response.ok) {
           throw new Error("Unable to load intro owl luma data.");
         }
         return response.arrayBuffer();
       }),
-      fetch(metadata.edgeFile).then((response) => {
+      fetch(metadata.edgeFile, { priority: "low" }).then((response) => {
         if (!response.ok) {
           throw new Error("Unable to load intro owl edge data.");
         }
         return response.arrayBuffer();
       }),
-      fetch(metadata.maskFile).then((response) => {
+      fetch(metadata.maskFile, { priority: "low" }).then((response) => {
         if (!response.ok) {
           throw new Error("Unable to load intro owl mask data.");
         }
@@ -16659,6 +16695,11 @@ async function boot() {
   setupStartupEntry();
   updateIntroScale();
   setupShellInteractions();
+  // Give the browser one paint opportunity to commit the visible entry scene
+  // before initiating the multi-megabyte canvas data streams. The animation
+  // has already started; this only separates critical and background network
+  // work by a single frame.
+  await new Promise((resolve) => window.requestAnimationFrame(resolve));
   // Fetch the intro owl in parallel with the camera data while the startup
   // cover is still visible. It must never be a first-scroll lazy dependency.
   const introOwlPreload = loadIntroOwlData().catch((error) => {
@@ -16690,15 +16731,10 @@ async function boot() {
   setupIntroOwlScramble();
   setupWorkOwlRenderLoop();
 
-  // Begin texture decode and heavy glyph preparation while the startup cover
-  // is still authoritative. A quick first scroll must never be the event that
-  // pays these one-time costs.
-  const capabilityAssetsReady = warmCapabilityCardAssets().catch((error) => {
-    console.error("Unable to warm the capability card assets.", error);
-  });
-  const galleryAssetsReady = warmWorkWaveAssets().catch((error) => {
-    console.error("Unable to warm the gallery assets.", error);
-  });
+  // Begin image decoding after the startup's critical paint has had a clear
+  // network window. The fixed schedule is deliberately not idle-only: Safari
+  // must still prepare these sections before a fast first scroll reaches them.
+  schedulePostStartupAssetWarmup();
   // Canvas preparation is intentionally independent from image decoding.
   // On a cold connection the card textures may take longer, but that must
   // never postpone burst/footer preparation until the user reaches them.
@@ -16716,10 +16752,16 @@ async function boot() {
   ScrollTrigger.update();
   await startupEntryChoice;
   await introOwlPreload;
+  // A user entry immediately promotes the already-scheduled image work. This
+  // changes request priority only; authored timelines and reveal states remain
+  // identical.
+  const postStartupAssetsReady = beginPostStartupAssetWarmup("high").catch((error) => {
+    console.error("Unable to warm post-startup image assets.", error);
+  });
   // A cold Safari visit must not discover and decode the card/gallery
   // textures only after their ScrollTriggers have already been crossed.
   await settleWithTimeout(
-    Promise.all([capabilityAssetsReady, galleryAssetsReady]),
+    postStartupAssetsReady,
     3200,
   );
   await settleWithTimeout(canvasEffectsReady, IS_SAFARI_BROWSER ? 5200 : 1600);
@@ -16765,6 +16807,9 @@ function recoverDocumentAfterInterruptedBoot(error = null) {
     gsap.set(pageTransitionRoot, { autoAlpha: 0 });
   }
   hideStartupLoader();
+  if (heroIntro instanceof HTMLElement) {
+    gsap.set(heroIntro, { xPercent: 0, autoAlpha: 1 });
+  }
   releaseHeroScrollGate();
   cancelIntroRevealLock();
   startupExperienceReady = true;

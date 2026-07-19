@@ -1,5 +1,18 @@
-@import url("https://api.fontshare.com/v2/css?f[]=gambarino@400&display=swap");
-@import url("https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;900&display=swap");
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/Geist-Variable-Latin.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Gambarino";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/Gambarino-Regular.woff2") format("woff2");
+}
 
 @font-face {
   font-family: "Lay Grotesk";
@@ -402,6 +415,8 @@ body[data-current-page="experience"] .empty-route-page {
   width: 100%;
   padding: 0 clamp(28px, 8vw, 120px);
   color: var(--ink);
+  visibility: hidden;
+  opacity: 0;
   pointer-events: none;
   text-align: center;
   user-select: none;

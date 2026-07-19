@@ -3,10 +3,6 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link rel="preconnect" href="https://api.fontshare.com" />
-    <link rel="preconnect" href="https://cdn.fontshare.com" crossorigin />
     <meta
       name="description"
       content="Manish's portfolio across design, photography, motion, and code."
@@ -42,23 +38,26 @@
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <link
       rel="preload"
-      href="/frame-data.json"
-      as="fetch"
-      type="application/json"
-      crossorigin="anonymous"
+      href="/barn-owl-logo-192.webp"
+      imagesrcset="/barn-owl-logo-96.webp 96w, /barn-owl-logo-192.webp 192w, /barn-owl-logo-288.webp 288w"
+      imagesizes="clamp(68px, 6.6vw, 88px)"
+      as="image"
+      type="image/webp"
+      fetchpriority="high"
     />
     <link
       rel="preload"
-      href="/frame-density.bin"
-      as="fetch"
-      type="application/octet-stream"
+      href="/fonts/Gambarino-Regular.woff2"
+      as="font"
+      type="font/woff2"
       crossorigin="anonymous"
+      fetchpriority="high"
     />
     <link
       rel="preload"
-      href="/frame-silhouette.bin"
-      as="fetch"
-      type="application/octet-stream"
+      href="/fonts/Geist-Variable-Latin.woff2"
+      as="font"
+      type="font/woff2"
       crossorigin="anonymous"
     />
     <link
@@ -67,13 +66,7 @@
       as="font"
       type="font/woff2"
       crossorigin="anonymous"
-    />
-    <link
-      rel="preload"
-      href="/fonts/LayGrotesk-Regular.otf"
-      as="font"
-      type="font/otf"
-      crossorigin="anonymous"
+      fetchpriority="low"
     />
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -89,9 +82,13 @@
       <div class="startup-entry" data-startup-entry>
         <img
           class="startup-entry__logo"
-          src="/barn-owl-logo.png"
-          width="500"
-          height="500"
+          src="/barn-owl-logo-192.webp"
+          srcset="/barn-owl-logo-96.webp 96w, /barn-owl-logo-192.webp 192w, /barn-owl-logo-288.webp 288w"
+          sizes="clamp(68px, 6.6vw, 88px)"
+          width="288"
+          height="288"
+          fetchpriority="high"
+          decoding="sync"
           alt=""
           aria-hidden="true"
           data-startup-entry-logo
@@ -125,7 +122,15 @@
         data-nav-target="work"
         aria-label="Back to work"
       >
-        <img src="/barn-owl-logo.png" width="500" height="500" alt="" />
+        <img
+          src="/barn-owl-logo-96.webp"
+          srcset="/barn-owl-logo-96.webp 96w, /barn-owl-logo-192.webp 192w"
+          sizes="38px"
+          width="192"
+          height="192"
+          decoding="async"
+          alt=""
+        />
       </button>
 
       <nav class="section-nav" aria-label="Primary navigation" data-section-nav>
@@ -464,11 +469,13 @@
                   <div class="capability-card__inner" data-capability-card-inner>
                     <div class="capability-card__face capability-card__face--front">
                       <img
-                        src="/card-fronts/design-front.jpg"
+                        src="/card-fronts/design-front-400.webp"
+                        srcset="/card-fronts/design-front-400.webp 400w, /card-fronts/design-front-640.webp 640w, /card-fronts/design-front.jpg 736w"
+                        sizes="(max-width: 760px) 150px, 300px"
                         width="736"
                         height="943"
-                        loading="eager"
-                        fetchpriority="auto"
+                        loading="lazy"
+                        fetchpriority="low"
                         decoding="async"
                         alt=""
                       />
@@ -476,10 +483,12 @@
                     <div class="capability-card__face capability-card__face--back">
                       <div class="capability-card__cover">
                         <img
-                          src="/card-covers/design.webp"
+                          src="/card-covers/design-360.webp"
+                          srcset="/card-covers/design-360.webp 360w, /card-covers/design-720.webp 720w, /card-covers/design.webp 1065w"
+                          sizes="(max-width: 760px) 140px, 280px"
                           width="1065"
                           height="992"
-                          loading="eager"
+                          loading="lazy"
                           fetchpriority="low"
                           decoding="async"
                           alt=""
@@ -518,11 +527,13 @@
                   <div class="capability-card__inner" data-capability-card-inner>
                     <div class="capability-card__face capability-card__face--front">
                       <img
-                        src="/card-fronts/photography-front.jpg"
+                        src="/card-fronts/photography-front-400.webp"
+                        srcset="/card-fronts/photography-front-400.webp 400w, /card-fronts/photography-front.jpg 736w"
+                        sizes="(max-width: 760px) 150px, 300px"
                         width="736"
                         height="915"
-                        loading="eager"
-                        fetchpriority="auto"
+                        loading="lazy"
+                        fetchpriority="low"
                         decoding="async"
                         alt=""
                       />
@@ -530,10 +541,12 @@
                     <div class="capability-card__face capability-card__face--back">
                       <div class="capability-card__cover">
                         <img
-                          src="/card-covers/photography.webp"
+                          src="/card-covers/photography-360.webp"
+                          srcset="/card-covers/photography-360.webp 360w, /card-covers/photography-720.webp 720w, /card-covers/photography.webp 1083w"
+                          sizes="(max-width: 760px) 140px, 280px"
                           width="1083"
                           height="992"
-                          loading="eager"
+                          loading="lazy"
                           fetchpriority="low"
                           decoding="async"
                           alt=""
@@ -572,11 +585,13 @@
                   <div class="capability-card__inner" data-capability-card-inner>
                     <div class="capability-card__face capability-card__face--front">
                       <img
-                        src="/card-fronts/code-front.jpg"
+                        src="/card-fronts/code-front-400.webp"
+                        srcset="/card-fronts/code-front-400.webp 400w, /card-fronts/code-front.jpg 736w"
+                        sizes="(max-width: 760px) 150px, 300px"
                         width="736"
                         height="981"
-                        loading="eager"
-                        fetchpriority="auto"
+                        loading="lazy"
+                        fetchpriority="low"
                         decoding="async"
                         alt=""
                       />
@@ -584,10 +599,12 @@
                     <div class="capability-card__face capability-card__face--back">
                       <div class="capability-card__cover">
                         <img
-                          src="/card-covers/code.webp"
+                          src="/card-covers/code-360.webp"
+                          srcset="/card-covers/code-360.webp 360w, /card-covers/code-720.webp 720w, /card-covers/code.webp 1060w"
+                          sizes="(max-width: 760px) 140px, 280px"
                           width="1060"
                           height="1008"
-                          loading="eager"
+                          loading="lazy"
                           fetchpriority="low"
                           decoding="async"
                           alt=""
