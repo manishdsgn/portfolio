@@ -71,17 +71,19 @@ const playOrganicSwooshSound = defineSound(introHighlightSwoosh);
 const playSoftKeyPressSound = defineSound(introKeyPressSound);
 const playMechanicalNotificationSound = defineSound(mechanicalNotification);
 const playPageTransitionNoiseSound = defineSound(synthNoiseFiltered);
-// Keep the authored ascending colour-note relationship, but constrain it to
-// one stable register. The former octave accumulation eventually pushed the
-// FM voice into a harsh/loud Safari range.
+// Preserve the authored ascending colour-note relationship in DOM order. The
+// limiter, reduced voice count and lower cue volume keep Safari's output
+// stable without folding the final notes back down the scale.
 const INTRO_HIGHLIGHT_SWOOSH_SCALE = Object.freeze([
   0,
-  160,
-  320,
-  480,
-  640,
-  480,
-  320,
+  200,
+  400,
+  500,
+  700,
+  900,
+  1100,
+  1200,
+  1400,
 ]);
 const INTRO_HIGHLIGHT_SWOOSH_VOLUME = 0.28;
 const INTRO_HIGHLIGHT_SWOOSH_MIN_INTERVAL_MS = 88;
@@ -96,7 +98,6 @@ const INTRO_KEY_PRESS_RELEASE = 0.018;
 const GLYPH_SPLASH_VOLUME = 0.35;
 const FOOTER_ORGAN_GLYPH_VOLUME = 0.9;
 const DOT_GLITCH_NOTIFICATION_VOLUME = 0.2;
-const DOT_GLITCH_NOTIFICATION_MIN_INTERVAL_MS = 84;
 const CAPABILITY_HIGHLIGHT_INITIAL_TAP_VOLUME = 0.62;
 const CAPABILITY_HIGHLIGHT_TAP_CARD_OFFSET = 0.045;
 const PAGE_TRANSITION_NOISE_VOLUME = 0.16;
@@ -153,7 +154,6 @@ const introHighlightSwooshVoices = [];
 let pageTransitionNoiseVoice = null;
 let galleryPopLastPlayedAt = Number.NEGATIVE_INFINITY;
 let capabilityTapLastPlayedAt = Number.NEGATIVE_INFINITY;
-let dotGlitchNotificationLastPlayedAt = Number.NEGATIVE_INFINITY;
 
 function configureProjectAudioGraph() {
   const masterBus = getWebKitsAudioMasterBus();
@@ -480,13 +480,6 @@ function playCapabilityHighlightTap(volume = CAPABILITY_HIGHLIGHT_INITIAL_TAP_VO
 
 function playDotGlitchNotification() {
   if (!isProjectAudioRunning()) return;
-
-  const now = performance.now();
-  if (
-    now - dotGlitchNotificationLastPlayedAt <
-    DOT_GLITCH_NOTIFICATION_MIN_INTERVAL_MS
-  ) return;
-  dotGlitchNotificationLastPlayedAt = now;
 
   playMechanicalNotificationSound({ volume: DOT_GLITCH_NOTIFICATION_VOLUME });
 }
@@ -1133,6 +1126,11 @@ const BLUE_DARK = { r: 25, g: 67, b: 245 };
 const COVER_SCALE_BOOST = 1.08;
 const CAMERA_MOBILE_BREAKPOINT = 620;
 const CAMERA_MOBILE_SCALE_BOOST = 1.02;
+// The camera was art-directed at this desktop canvas. Larger displays gain
+// breathing room rather than proportionally enlarging the camera; smaller
+// viewports retain the existing cover behaviour.
+const CAMERA_DESKTOP_ARTBOARD_WIDTH = 1440;
+const CAMERA_DESKTOP_ARTBOARD_HEIGHT = 900;
 const CAPABILITY_OWL_READY_PROGRESS = 0.74;
 const CAPABILITY_GLYPH_BURST_TRIGGER_PROGRESS = 0.585;
 const CAPABILITY_GLYPH_BURST_DURATION = 0.76;
@@ -4540,9 +4538,15 @@ function updateLayout() {
   const cameraScaleBoost = viewportWidth <= CAMERA_MOBILE_BREAKPOINT
     ? CAMERA_MOBILE_SCALE_BOOST
     : COVER_SCALE_BOOST;
+  const layoutWidth = viewportWidth > CAMERA_DESKTOP_ARTBOARD_WIDTH
+    ? Math.min(state.canvasWidth, CAMERA_DESKTOP_ARTBOARD_WIDTH)
+    : state.canvasWidth;
+  const layoutHeight = viewportWidth > CAMERA_DESKTOP_ARTBOARD_WIDTH
+    ? Math.min(state.canvasHeight, CAMERA_DESKTOP_ARTBOARD_HEIGHT)
+    : state.canvasHeight;
   const scale = Math.max(
-    state.canvasWidth / state.sourceWidth,
-    state.canvasHeight / state.sourceHeight,
+    layoutWidth / state.sourceWidth,
+    layoutHeight / state.sourceHeight,
   ) * cameraScaleBoost;
 
   const rawCellSize = Math.min(
@@ -9758,10 +9762,10 @@ function setupSmoothScroll() {
     // when Safari misses an animation frame instead of jumping to the target.
     lerp: IS_SAFARI_BROWSER ? 0.115 : 0.12,
     smoothWheel: true,
-    // Mac trackpads arrive as wheel input and remain fully smoothed. Keeping
-    // WebKit touch momentum native avoids a second inertia model on iOS while
-    // Lenis still owns scroll synchronization and programmatic scrolls.
-    syncTouch: !IS_SAFARI_BROWSER,
+    // Touch and wheel must share the same interpolated clock. Leaving iOS on
+    // native momentum made its gallery transforms jump ahead of the Lenis /
+    // ScrollTrigger transaction used by every other browser.
+    syncTouch: true,
     stopInertiaOnNavigate: true,
   });
 
@@ -10890,7 +10894,34 @@ function setupFooterMonoGlow() {
     svg.append(group);
   });
 
-  footerMonoGlow.append(svg);
+  if (IS_SAFARI_BROWSER) {
+    // WebKit repaints every live SVG blur whenever one bar scales. Snapshot
+    // the finished artwork once, then animate nine clipped raster slices with
+    // the same transforms and stagger. The appearance and timing stay intact
+    // while the footer entrance becomes compositor-only.
+    const source = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+      new XMLSerializer().serializeToString(svg),
+    )}`;
+
+    for (let index = 0; index < FOOTER_MONO_GLOW_CONFIG.bars; index += 1) {
+      const tile = document.createElement("span");
+      const image = document.createElement("img");
+      tile.className = "site-footer__mono-glow-tile";
+      tile.dataset.footerMonoGlowTile = "true";
+      tile.style.left = `${index / FOOTER_MONO_GLOW_CONFIG.bars * 100}%`;
+      tile.style.width = `${100 / FOOTER_MONO_GLOW_CONFIG.bars}%`;
+      image.src = source;
+      image.alt = "";
+      image.decoding = "async";
+      image.draggable = false;
+      image.style.left = `${-index * 100}%`;
+      image.style.width = `${FOOTER_MONO_GLOW_CONFIG.bars * 100}%`;
+      tile.append(image);
+      footerMonoGlow.append(tile);
+    }
+  } else {
+    footerMonoGlow.append(svg);
+  }
   footerMonoGlow.dataset.ready = "true";
 }
 
