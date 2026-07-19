@@ -1544,7 +1544,7 @@ body.capability-cards-active .capability-card__keyword::before {
 }
 
 .work-owl-scene.site-footer {
-  --footer-owl-size: clamp(250px, 25vw, 410px);
+  --footer-owl-size: clamp(270px, 27vw, 445px);
   --footer-word-gap: clamp(24px, 3.2vw, 46px);
   --footer-edge-padding: clamp(18px, 4vw, 64px);
   position: relative;
@@ -3083,7 +3083,7 @@ body .route-transition-snapshot .work-owl-flight-layer {
   }
 
   .work-owl-scene.site-footer {
-    --footer-owl-size: min(84vw, 360px);
+    --footer-owl-size: min(88vw, 390px);
     --footer-word-gap: clamp(18px, 5.8vw, 34px);
     --footer-edge-padding: 16px;
     min-height: 172svh;
@@ -3315,7 +3315,7 @@ body .route-transition-snapshot .work-owl-flight-layer {
   }
 
   .work-owl-scene.site-footer {
-    --footer-owl-size: min(42vw, 360px);
+    --footer-owl-size: min(45vw, 390px);
     --footer-word-gap: clamp(22px, 4.5vw, 42px);
   }
 
@@ -3375,7 +3375,7 @@ body .route-transition-snapshot .work-owl-flight-layer {
   }
 
   .work-owl-scene.site-footer {
-    --footer-owl-size: min(84vw, 360px);
+    --footer-owl-size: min(88vw, 390px);
     --footer-word-gap: clamp(18px, 5.8vw, 34px);
     --footer-edge-padding: 16px;
     min-height: 172svh;

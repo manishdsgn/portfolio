@@ -54,6 +54,18 @@ const playOrganicSwooshSound = defineSound(introHighlightSwoosh);
 const playSoftKeyPressSound = defineSound(introKeyPressSound);
 const playMechanicalNotificationSound = defineSound(mechanicalNotification);
 const playPageTransitionNoiseSound = defineSound(synthNoiseFiltered);
+// Keep the authored ascending colour-note relationship, but constrain it to
+// one stable register. The former octave accumulation eventually pushed the
+// FM voice into a harsh/loud Safari range.
+const INTRO_HIGHLIGHT_SWOOSH_SCALE = Object.freeze([
+  0,
+  160,
+  320,
+  480,
+  640,
+  480,
+  320,
+]);
 const INTRO_HIGHLIGHT_SWOOSH_VOLUME = 0.28;
 const INTRO_HIGHLIGHT_SWOOSH_MIN_INTERVAL_MS = 88;
 const INTRO_HIGHLIGHT_SWOOSH_MAX_VOICES = 2;
@@ -478,8 +490,13 @@ function fadeOutPageTransitionNoise() {
   pageTransitionNoiseVoice = null;
 }
 
-function getIntroHighlightSwooshDetune() {
-  return 0;
+function getIntroHighlightSwooshDetune(word) {
+  const highlightWords = getIntroHighlightWords();
+  const wordIndex = Math.max(0, highlightWords.indexOf(word));
+
+  return INTRO_HIGHLIGHT_SWOOSH_SCALE[
+    wordIndex % INTRO_HIGHLIGHT_SWOOSH_SCALE.length
+  ];
 }
 
 function removeIntroHighlightSwooshVoice(entry) {
@@ -3302,7 +3319,10 @@ function updateVisibleScrollTriggers(scrollState = null) {
   }
 
   ScrollTrigger.update();
-  scheduleCriticalSceneSync();
+  // ScrollTrigger has already reconciled every active scene in this frame.
+  // Scheduling the same card/footer transaction again made WebKit perform a
+  // second geometry pass for each Lenis event. Explicit route/settle paths
+  // still request a critical sync when one is actually needed.
 }
 
 function scheduleCriticalSceneSync() {
@@ -9353,7 +9373,10 @@ function setupSmoothScroll() {
     touchMultiplier: 1,
     touchInertiaExponent: 1.7,
     syncTouchLerp: 0.075,
-    lerp: 0.18,
+    // A lower interpolation factor restores the deliberate Lenis glide in
+    // both Chromium and WebKit. Lenis' time-corrected lerp keeps this stable
+    // when Safari misses an animation frame instead of jumping to the target.
+    lerp: IS_SAFARI_BROWSER ? 0.115 : 0.12,
     smoothWheel: true,
     // Mac trackpads arrive as wheel input and remain fully smoothed. Keeping
     // WebKit touch momentum native avoids a second inertia model on iOS while
@@ -13092,14 +13115,17 @@ function renderGlyphBurst(state, progress) {
   }
 
   const liveOrigin = state.originProvider?.();
-  if (Number.isFinite(liveOrigin?.x) && Number.isFinite(liveOrigin?.y)) {
-    state.originX = liveOrigin.x;
-    state.originY = liveOrigin.y;
-  }
 
   const clampedProgress = clamp(progress, 0, 1);
-  const originX = state.originX;
-  const originY = state.originY;
+  // A moving interaction origin must not overwrite the origin used to prove
+  // that the reusable field is prepared. Doing so made the second project
+  // hover fail `isGlyphBurstPrepared()` even though the canvas was valid.
+  const originX = Number.isFinite(liveOrigin?.x)
+    ? liveOrigin.x
+    : state.originX;
+  const originY = Number.isFinite(liveOrigin?.y)
+    ? liveOrigin.y
+    : state.originY;
   const cellSize = CAPABILITY_GLYPH_BURST_CELL_SIZE;
   const maxRadius = Math.max(
     Math.hypot(originX, originY),
@@ -13852,11 +13878,9 @@ function setupCapabilityCards() {
         },
         onLeave: () => {
           updateCards(1);
-          document.body.classList.remove("capability-cards-active");
-          cleanupBlueRunners();
           // The section remains visible for one viewport after its sticky
-          // range ends. Let a queued/playing burst finish in that visible
-          // tail instead of cancelling it at the ScrollTrigger boundary.
+          // range ends. Keep the blue runners, their audio, and compositor
+          // hints alive until the cards themselves have cleared the viewport.
           if (glyphBurstPending) attemptCapabilityGlyphBurst();
         },
         onLeaveBack: () => {
@@ -13869,18 +13893,48 @@ function setupCapabilityCards() {
         onRefresh: (self) => {
           refreshCardMetrics();
           updateCards(self.progress, true);
-          document.body.classList.toggle(
-            "capability-cards-active",
-            self.isActive,
-          );
           if (!self.isActive) {
-            cleanupBlueRunners();
             const bounds = capabilityCardsSection.getBoundingClientRect();
-            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) {
+            const sectionIsVisible =
+              bounds.bottom > 0 && bounds.top < window.innerHeight;
+            document.body.classList.toggle(
+              "capability-cards-active",
+              sectionIsVisible,
+            );
+            if (!sectionIsVisible) {
+              cleanupBlueRunners();
               glyphBurstPending = false;
               stopCapabilityGlyphBurst();
             }
+          } else {
+            document.body.classList.add("capability-cards-active");
           }
+        },
+      });
+
+      // The progress trigger ends when the sticky range releases, one
+      // viewport before the cards have visually left. This presence trigger
+      // owns teardown so blue highlights remain visible and audible during
+      // the handoff to the first project folder.
+      const cardsPresenceTrigger = ScrollTrigger.create({
+        trigger: capabilityCardsSection,
+        start: "top bottom",
+        end: "bottom top",
+        onEnter: () => {
+          document.body.classList.add("capability-cards-active");
+        },
+        onEnterBack: () => {
+          document.body.classList.add("capability-cards-active");
+        },
+        onLeave: () => {
+          document.body.classList.remove("capability-cards-active");
+          cleanupBlueRunners();
+          stopCapabilityGlyphBurst();
+        },
+        onLeaveBack: () => {
+          document.body.classList.remove("capability-cards-active");
+          cleanupBlueRunners();
+          stopCapabilityGlyphBurst();
         },
       });
 
@@ -13888,13 +13942,14 @@ function setupCapabilityCards() {
         updateCards(cardsScrollTrigger.progress);
         document.body.classList.toggle(
           "capability-cards-active",
-          cardsScrollTrigger.isActive,
+          cardsPresenceTrigger.isActive,
         );
       };
       syncCapabilityCardsFromScroll = syncCards;
       syncCards();
 
       return () => {
+        cardsPresenceTrigger.kill();
         if (syncCapabilityCardsFromScroll === syncCards) {
           syncCapabilityCardsFromScroll = null;
         }
