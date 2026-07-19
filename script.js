@@ -31,37 +31,6 @@ const DEV_SCROLL_ENGINE_OVERRIDE = import.meta.env.DEV
   : null;
 const FORCE_NATIVE_SCROLL = DEV_SCROLL_ENGINE_OVERRIDE === "native";
 
-function moveSoundEffectsToLayers(definition, extraEffects = []) {
-  const {
-    effects: definitionEffects = [],
-    layers,
-    ...singleLayer
-  } = definition;
-  const sharedEffects = [...definitionEffects, ...extraEffects];
-
-  if (Array.isArray(layers)) {
-    return Object.freeze({
-      ...singleLayer,
-      layers: Object.freeze(layers.map((layer) => Object.freeze({
-        ...layer,
-        effects: Object.freeze([
-          ...(layer.effects ?? []),
-          ...sharedEffects,
-        ]),
-      }))),
-    });
-  }
-
-  return Object.freeze({
-    layers: Object.freeze([
-      Object.freeze({
-        ...singleLayer,
-        effects: Object.freeze(sharedEffects),
-      }),
-    ]),
-  });
-}
-
 function removeDefinitionEffects(definition) {
   const { effects: _effects, ...effectSafeDefinition } = definition;
   return Object.freeze(effectSafeDefinition);
@@ -76,68 +45,39 @@ const playFooterOrganGlyphSound = defineSound(
 );
 const playMinimalPopSound = defineSound(minimalPop);
 const playMinimalTapSound = defineSound(minimalTap);
-const introKeyPressSound = moveSoundEffectsToLayers(
-  softKeyPress,
-  [
-    {
-      type: "compressor",
-      threshold: -24,
-      knee: 12,
-      ratio: 8,
-      attack: 0.001,
-      release: 0.06,
-    },
-  ],
-);
-const introHighlightSwoosh = moveSoundEffectsToLayers(
-  organicSwoosh,
-  [
-    {
-      type: "compressor",
-      threshold: -20,
-      knee: 8,
-      ratio: 10,
-      attack: 0.002,
-      release: 0.16,
-    },
-  ],
-);
+// Keep the high-frequency micro-cues dry and deterministic. Per-voice effect
+// chains made overlapping Safari voices pump at different levels, while the
+// project-wide limiter already provides peak control.
+const introKeyPressSound = removeDefinitionEffects(softKeyPress);
+const introHighlightSwoosh = removeDefinitionEffects(organicSwoosh);
 const playOrganicSwooshSound = defineSound(introHighlightSwoosh);
 const playSoftKeyPressSound = defineSound(introKeyPressSound);
 const playMechanicalNotificationSound = defineSound(mechanicalNotification);
 const playPageTransitionNoiseSound = defineSound(synthNoiseFiltered);
-const INTRO_HIGHLIGHT_SWOOSH_SCALE = Object.freeze([
-  0,
-  200,
-  400,
-  500,
-  700,
-  900,
-  1100,
-]);
-const INTRO_HIGHLIGHT_SWOOSH_VOLUME = 0.42;
-const INTRO_HIGHLIGHT_SWOOSH_MIN_INTERVAL_MS = 56;
-const INTRO_HIGHLIGHT_SWOOSH_MAX_VOICES = 4;
+const INTRO_HIGHLIGHT_SWOOSH_VOLUME = 0.28;
+const INTRO_HIGHLIGHT_SWOOSH_MIN_INTERVAL_MS = 88;
+const INTRO_HIGHLIGHT_SWOOSH_MAX_VOICES = 2;
 const INTRO_HIGHLIGHT_SWOOSH_VOICE_LIFETIME_MS = 620;
 const INTRO_HIGHLIGHT_SWOOSH_RELEASE = 0.04;
-const INTRO_KEY_PRESS_VOLUME = 0.48;
-const INTRO_KEY_PRESS_OVERLAP_VOLUME_SCALE = 0.7;
+const INTRO_KEY_PRESS_VOLUME = 0.32;
+const INTRO_KEY_PRESS_OVERLAP_VOLUME_SCALE = 0.5;
 const INTRO_KEY_PRESS_MAX_VOICES = 2;
 const INTRO_KEY_PRESS_VOICE_LIFETIME_MS = 120;
 const INTRO_KEY_PRESS_RELEASE = 0.018;
 const GLYPH_SPLASH_VOLUME = 0.35;
 const FOOTER_ORGAN_GLYPH_VOLUME = 0.9;
-const DOT_GLITCH_NOTIFICATION_VOLUME = 0.36;
+const DOT_GLITCH_NOTIFICATION_VOLUME = 0.2;
+const DOT_GLITCH_NOTIFICATION_MIN_INTERVAL_MS = 84;
 const CAPABILITY_HIGHLIGHT_INITIAL_TAP_VOLUME = 0.62;
 const CAPABILITY_HIGHLIGHT_TAP_CARD_OFFSET = 0.045;
 const PAGE_TRANSITION_NOISE_VOLUME = 0.16;
 const PAGE_TRANSITION_NOISE_FADE_OUT_DURATION = 0.48;
-const PROJECT_AUDIO_MASTER_VOLUME = 0.58;
+const PROJECT_AUDIO_MASTER_VOLUME = 0.5;
 const PROJECT_AUDIO_UNLOCK_TIMEOUT_MS = 1400;
 const GALLERY_POP_MIN_INTERVAL_MS = 110;
 const CAPABILITY_TAP_MIN_INTERVAL_MS = 90;
 const INTRO_KEY_PRESS_MIN_INTERVAL_MS = 28;
-const INTRO_KEY_PRESS_DETUNE_PATTERN = Object.freeze([-45, 0, 35, 0]);
+const INTRO_KEY_PRESS_DETUNE_PATTERN = Object.freeze([0]);
 const CAMERA_AMBIENT_SOUND_PATH = "/audio/hero-ambient-swell.mp3";
 const CAMERA_AMBIENT_RISE_VOLUME = 0.09;
 const CAMERA_AMBIENT_PEAK_VOLUME = 0.2;
@@ -184,6 +124,7 @@ const introHighlightSwooshVoices = [];
 let pageTransitionNoiseVoice = null;
 let galleryPopLastPlayedAt = Number.NEGATIVE_INFINITY;
 let capabilityTapLastPlayedAt = Number.NEGATIVE_INFINITY;
+let dotGlitchNotificationLastPlayedAt = Number.NEGATIVE_INFINITY;
 
 function configureProjectAudioGraph() {
   const masterBus = getWebKitsAudioMasterBus();
@@ -198,12 +139,12 @@ function configureProjectAudioGraph() {
     projectAudioContext = context;
     projectAudioLimiter = context.createDynamicsCompressor();
     projectAudioCeiling = context.createGain();
-    projectAudioLimiter.threshold.value = -12;
+    projectAudioLimiter.threshold.value = -16;
     projectAudioLimiter.knee.value = 6;
     projectAudioLimiter.ratio.value = 14;
-    projectAudioLimiter.attack.value = 0.003;
+    projectAudioLimiter.attack.value = 0.001;
     projectAudioLimiter.release.value = 0.14;
-    projectAudioCeiling.gain.value = 0.92;
+    projectAudioCeiling.gain.value = 0.82;
 
     try {
       masterBus.disconnect();
@@ -224,6 +165,9 @@ function configureProjectAudioGraph() {
   }
 
   setWebKitsMasterVolume(PROJECT_AUDIO_MASTER_VOLUME);
+  if (import.meta.env.DEV) {
+    window.__portfolioAudioContext = context;
+  }
 
   return context;
 }
@@ -508,6 +452,13 @@ function playCapabilityHighlightTap(volume = CAPABILITY_HIGHLIGHT_INITIAL_TAP_VO
 function playDotGlitchNotification() {
   if (!isProjectAudioRunning()) return;
 
+  const now = performance.now();
+  if (
+    now - dotGlitchNotificationLastPlayedAt <
+    DOT_GLITCH_NOTIFICATION_MIN_INTERVAL_MS
+  ) return;
+  dotGlitchNotificationLastPlayedAt = now;
+
   playMechanicalNotificationSound({ volume: DOT_GLITCH_NOTIFICATION_VOLUME });
 }
 
@@ -527,13 +478,8 @@ function fadeOutPageTransitionNoise() {
   pageTransitionNoiseVoice = null;
 }
 
-function getIntroHighlightSwooshDetune(word) {
-  const highlightWords = getIntroHighlightWords();
-  const wordIndex = Math.max(0, highlightWords.indexOf(word));
-  const scaleIndex = wordIndex % INTRO_HIGHLIGHT_SWOOSH_SCALE.length;
-  const octave = Math.floor(wordIndex / INTRO_HIGHLIGHT_SWOOSH_SCALE.length);
-
-  return INTRO_HIGHLIGHT_SWOOSH_SCALE[scaleIndex] + octave * 1200;
+function getIntroHighlightSwooshDetune() {
+  return 0;
 }
 
 function removeIntroHighlightSwooshVoice(entry) {
@@ -9401,7 +9347,7 @@ function setupSmoothScroll() {
     typeof CSS !== "undefined" &&
     CSS.supports?.("transition-behavior", "allow-discrete") === true;
   const lenis = new Lenis({
-    autoRaf: false,
+    autoRaf: true,
     autoToggle: supportsAutoToggle,
     wheelMultiplier: 1,
     touchMultiplier: 1,
@@ -9417,23 +9363,18 @@ function setupSmoothScroll() {
   });
 
   smoothScroller = lenis;
+  if (import.meta.env.DEV) {
+    window.__portfolioLenis = lenis;
+  }
   scrollEngineMode = "lenis";
   lenis.on("scroll", updateVisibleScrollTriggers);
-  smoothScrollTickerCallback = (time, deltaTime) => {
-    lenis.raf(time * 1000);
-    runWorkRenderScheduler(time, deltaTime);
-  };
-  // Prioritize scroll interpolation before canvas and decorative callbacks so
-  // ScrollTrigger reads the current Lenis position on the same frame.
-  gsap.ticker.add(smoothScrollTickerCallback, false, true);
-  gsap.ticker.lagSmoothing(0);
+  // Lenis owns its interpolation clock. Heavy Canvas 2D frames must not alter
+  // Lenis' delta time or make a missed GSAP frame turn into a scroll jump.
+  // DOM/canvas effects still share one GSAP scheduler of their own.
+  installRenderSchedulerTicker();
+  gsap.ticker.lagSmoothing(500, 33);
 
   window.addEventListener("wheel", armLenisInputWatchdog, { passive: true });
-  // Safari may commit a native scroll offset before Lenis emits its next
-  // interpolated update. Keep Lenis authoritative for motion, but use the
-  // native event to wake the single render scheduler and reconcile critical
-  // sticky scenes on that same ticker.
-  setupNativeScrollTracking();
   smoothScrollLockObserver?.disconnect();
   lastObservedScrollLockState = !shouldResumeSmoothScroll();
   smoothScrollLockObserver = new MutationObserver(() => {
@@ -11224,6 +11165,18 @@ function prepareFooterInteractionTimeline() {
 function playFooterInteraction() {
   if (document.body.dataset.currentPage !== "work") return;
   if (!(workOwlScene instanceof HTMLElement)) return;
+
+  // ScrollTrigger may report multiple boundary updates in one WebKit paint.
+  // Once the entrance owns the scene, those updates must never resolve it to
+  // the final frame before the first visible animation frame is painted.
+  if (footerInteractionState === "playing") {
+    setWorkOwlSceneActive(true, true);
+    if (footerInteractionTimeline?.paused()) {
+      footerInteractionTimeline.resume();
+    }
+    return;
+  }
+
   if (footerInteractionTimeline?.isActive()) {
     // The timeline can remain active while a ScrollTrigger refresh has
     // temporarily suspended only the canvas renderer. Resume it before the
@@ -11240,16 +11193,6 @@ function playFooterInteraction() {
   if (hasCompleted) {
     setFooterInteractionState("complete");
     setWorkOwlSceneActive(true, true);
-    return;
-  }
-
-  if (
-    footerInteractionTimeline !== null &&
-    !footerInteractionTimelinePrepared
-  ) {
-    // Once an entrance has started, interruption resolves forward. Rebuilding
-    // here made Safari replay the footer after a refresh or direction change.
-    setFooterInteractionFinal();
     return;
   }
 
@@ -12526,7 +12469,7 @@ function setupWorkOwlScene() {
   const updateWorkOwlSceneEntryY = () => {
     workOwlSceneEntryY = Math.max(
       0,
-      workOwlScene.offsetTop - window.innerHeight,
+      workOwlScene.offsetTop - window.innerHeight * 0.5,
     );
   };
 
@@ -12534,10 +12477,10 @@ function setupWorkOwlScene() {
 
   const reconcileFooterInteraction = () => {
     if (document.body.dataset.currentPage !== "work") return;
+    if (window.scrollY < workOwlSceneEntryY) return;
 
     const bounds = workOwlScene.getBoundingClientRect();
-    const hasReachedFooter =
-      bounds.top <= window.innerHeight && bounds.bottom > 0;
+    const hasReachedFooter = bounds.bottom > 0;
     if (!hasReachedFooter) return;
 
     if (footerInteractionState === "complete") {
@@ -12555,9 +12498,10 @@ function setupWorkOwlScene() {
 
   workOwlScenePresenceScrollTrigger = ScrollTrigger.create({
     trigger: workOwlScene,
-    // Start as the sticky stage enters. The sequence remains time-based, but
-    // it no longer waits until most of the first footer viewport has passed.
-    start: "top bottom",
+    // Begin when the footer's centre line enters the viewport. Starting at
+    // `top bottom` played the authored opening below the fold, so visitors
+    // only encountered its final state.
+    start: "top 50%",
     end: "bottom bottom",
     invalidateOnRefresh: true,
     onEnter: reconcileFooterInteraction,
@@ -12570,12 +12514,9 @@ function setupWorkOwlScene() {
     },
     onLeaveBack() {
       if (document.body.dataset.currentPage !== "work") return;
-      // The footer is a one-shot entrance for this page lifetime. If the user
-      // reverses direction during it, resolve to the authored final frame;
-      // never rewind into a blank footer that must be triggered again.
-      if (footerInteractionState === "playing") {
-        setFooterInteractionFinal();
-      }
+      // The time-based one-shot keeps advancing offscreen. WebKit can report
+      // a transient backward boundary while reconciling a sticky layer; that
+      // must not snap a visible entrance straight to its final frame.
       suspendWorkRouteScene();
     },
     onRefresh(self) {
@@ -12589,9 +12530,6 @@ function setupWorkOwlScene() {
       }
 
       if (self.progress <= 0) {
-        if (footerInteractionState === "playing") {
-          setFooterInteractionFinal();
-        }
         suspendWorkRouteScene();
       }
     },
@@ -13309,6 +13247,9 @@ function playGlyphBurst(
   state.maxDpr = maxDpr;
 
   const initialOrigin = originProvider?.() ?? origin;
+  const preparationOrigin = typeof originProvider === "function"
+    ? null
+    : initialOrigin;
 
   // Never allocate a full-screen glyph field on a scroll callback. A cold
   // Safari visit can otherwise spend its first section frame building and
@@ -13317,7 +13258,7 @@ function playGlyphBurst(
   // skip it for this pass and keep the cards/footer responsive.
   if (
     window.matchMedia("(prefers-reduced-motion: reduce)").matches ||
-    !isGlyphBurstPrepared(state, initialOrigin) ||
+    !isGlyphBurstPrepared(state, preparationOrigin) ||
     !(state.canvas instanceof HTMLCanvasElement)
   ) {
     onFinish?.();
@@ -13748,6 +13689,7 @@ function setupCapabilityCards() {
       let previousCardsProgress = 0;
       let glyphBurstArmed = true;
       let glyphBurstPending = false;
+      let renderedCardsProgress = Number.NaN;
       let cardHeights = capabilityCards.map((card) => card.offsetHeight);
       let cardsViewportHeight = window.innerHeight;
 
@@ -13773,7 +13715,16 @@ function setupCapabilityCards() {
         cardHeights = capabilityCards.map((card) => card.offsetHeight);
       };
 
-      const updateCards = (progress) => {
+      const updateCards = (progress, force = false) => {
+        if (
+          !force &&
+          Number.isFinite(renderedCardsProgress) &&
+          Math.abs(renderedCardsProgress - progress) < 0.00005
+        ) {
+          return;
+        }
+        renderedCardsProgress = progress;
+
         if (progress <= CAPABILITY_GLYPH_BURST_TRIGGER_PROGRESS - 0.055) {
           glyphBurstArmed = true;
           glyphBurstPending = false;
@@ -13909,7 +13860,7 @@ function setupCapabilityCards() {
         },
         onRefresh: (self) => {
           refreshCardMetrics();
-          updateCards(self.progress);
+          updateCards(self.progress, true);
           document.body.classList.toggle(
             "capability-cards-active",
             self.isActive,
@@ -15848,6 +15799,12 @@ async function prewarmDeferredCanvasEffects() {
   capabilityGlyphBurstState.maxDpr = CAPABILITY_GLYPH_BURST_MAX_DPR;
   buildGlyphBurst(capabilityGlyphBurstState);
   clearGlyphBurst(capabilityGlyphBurstState);
+
+  await waitForVisualWarmupOpportunity();
+
+  projectGlyphBurstState.maxDpr = CAPABILITY_GLYPH_BURST_MAX_DPR;
+  buildGlyphBurst(projectGlyphBurstState);
+  clearGlyphBurst(projectGlyphBurstState);
 
   await waitForVisualWarmupOpportunity();
 
