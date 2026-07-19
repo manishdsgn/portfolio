@@ -10838,7 +10838,15 @@ function addFooterWordSideArc(timeline, word, target, direction, position) {
   const motion = { progress: 0 };
   const setX = gsap.quickSetter(word, "x", "px");
   const setY = gsap.quickSetter(word, "y", "px");
-  const setScale = gsap.quickSetter(word, "scale");
+  // GSAP expands the `scale` alias to the literal string `scaleX,scaleY` in
+  // quickSetter. WebKit treats that as an invalid CSS property and aborts the
+  // timeline, so drive the two transform components explicitly.
+  const setScaleX = gsap.quickSetter(word, "scaleX");
+  const setScaleY = gsap.quickSetter(word, "scaleY");
+  const setScale = (value) => {
+    setScaleX(value);
+    setScaleY(value);
+  };
   const setRotation = gsap.quickSetter(word, "rotation", "deg");
   const arcLift = clamp((target.travel ?? Math.abs(target.liftY)) * 0.16, 10, 26);
   const control = {
