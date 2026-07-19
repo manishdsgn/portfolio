@@ -1,6 +1,7 @@
 import gsap from "gsap";
 import Lenis from "lenis";
 import "lenis/dist/lenis.css";
+import { injectSpeedInsights } from "@vercel/speed-insights";
 import { slotText } from "slot-text";
 import "slot-text/style.css";
 import {
@@ -20,6 +21,13 @@ import { notification as mechanicalNotification } from "./.web-kits/mechanical.t
 import { ScrollTrigger } from "gsap/ScrollTrigger";
 import { CustomEase } from "gsap/CustomEase";
 import { SplitText } from "gsap/SplitText";
+
+// Vercel provides the first-party collection route at deployment time. Keep
+// local animation profiling free of observability requests and collect from
+// both Vercel preview and production builds.
+if (import.meta.env.PROD) {
+  injectSpeedInsights();
+}
 
 gsap.registerPlugin(ScrollTrigger, CustomEase, SplitText);
 const IS_SAFARI_BROWSER =
