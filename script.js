@@ -1140,9 +1140,15 @@ const INTRO_OWL_MAX_DPR = IS_SAFARI_BROWSER ? 1 : 2;
 const WORK_OWL_MAX_DPR = IS_SAFARI_BROWSER ? 1 : 2;
 const CAMERA_MASK_THRESHOLD = 220;
 const CAMERA_MASK_FEATHER = 26;
-const CAMERA_FRAME_BLEND_PRECISION = IS_SAFARI_BROWSER ? 2 : 24;
+// Preserve the authored sub-frame interpolation in every browser. Reducing
+// WebKit to two buckets made Lenis move smoothly while the camera itself
+// visibly stepped between coarse raster states.
+const CAMERA_FRAME_BLEND_PRECISION = 24;
 const CAMERA_GLYPH_CACHE_LIMIT = 18;
 const CAMERA_TEMPORAL_BLEND_ALPHA = 0.045;
+const CAMERA_GLYPH_ATLAS_TONE_STEPS = 16;
+const CAMERA_GLYPH_ATLAS_ALPHA_STEPS = 16;
+const CAMERA_GLYPH_ATLAS_COLUMNS = 64;
 const EYPIECE_FRAME_INDEX = 46;
 const TUNNEL_FRAME_INDEX = 61;
 const EYPIECE_START_PROGRESS = 0.79;
@@ -1203,8 +1209,8 @@ const INTRO_OWL_LOOP_DURATION = 8;
 const INTRO_OWL_LOOP_END_FRAME = Number.POSITIVE_INFINITY;
 const INTRO_OWL_GLYPH_CACHE_LIMIT = 24;
 const INTRO_OWL_CLIP_MASK_CACHE_LIMIT = 24;
-const INTRO_OWL_FRAME_BLEND_PRECISION = IS_SAFARI_BROWSER ? 2 : 512;
-const INTRO_OWL_TARGET_FPS = 30;
+const INTRO_OWL_FRAME_BLEND_PRECISION = 512;
+const INTRO_OWL_TARGET_FPS = IS_SAFARI_BROWSER ? 60 : 30;
 const INTRO_OWL_TEMPORAL_BLEND_ALPHA = 0.025;
 const INTRO_OWL_BLUE_LIGHT = { r: 60, g: 102, b: 255 };
 const INTRO_OWL_BLUE_MID = { r: 25, g: 67, b: 245 };
@@ -1221,12 +1227,7 @@ const INTRO_OWL_CURSOR_EDGE_PADDING = 12;
 const WORK_OWL_SCENE_ENTER_DURATION = 0.9;
 const WORK_OWL_SCENE_START_MARGIN_RATIO = 0.62;
 const WORK_OWL_SCENE_START_FRAME_RATIO = 0.28;
-const WORK_OWL_TARGET_FPS = 30;
-const SAFARI_INTRO_OWL_TARGET_FPS = 24;
-const SAFARI_CAMERA_TARGET_FPS = 30;
-const SAFARI_CAMERA_FAST_SCROLL_TARGET_FPS = 20;
-const SAFARI_WORK_OWL_ACTIVE_TARGET_FPS = 18;
-const SAFARI_WORK_OWL_SETTLED_TARGET_FPS = 24;
+const WORK_OWL_TARGET_FPS = IS_SAFARI_BROWSER ? 60 : 30;
 // Disabled until a dense cropped atlas can preserve the source cadence. A
 // sparse full-canvas cache made the owl visibly step between frames.
 const SAFARI_INTRO_OWL_RASTER_FRAME_COUNT = 0;
@@ -1908,6 +1909,43 @@ const cameraPlaybackState = {
   whiteHoldUntil: 0,
 };
 
+const cameraGlyphAtlasState = {
+  canvas: null,
+  ctx: null,
+  key: "",
+  ready: false,
+  tileWidth: 0,
+  tileHeight: 0,
+  sourceTileWidth: 0,
+  sourceTileHeight: 0,
+  columns: 0,
+  characters: Array.from(new Set(GLYPH_FAMILIES.join(""))),
+  characterIndexes: new Map(),
+};
+
+cameraGlyphAtlasState.characters.forEach((character, index) => {
+  cameraGlyphAtlasState.characterIndexes.set(character, index);
+});
+
+function createOwlGlyphAtlasState() {
+  return {
+    canvas: null,
+    ctx: null,
+    key: "",
+    ready: false,
+    tileWidth: 0,
+    tileHeight: 0,
+    sourceTileWidth: 0,
+    sourceTileHeight: 0,
+    columns: 0,
+    characters: cameraGlyphAtlasState.characters,
+    characterIndexes: cameraGlyphAtlasState.characterIndexes,
+  };
+}
+
+const introOwlGlyphAtlasState = createOwlGlyphAtlasState();
+const workOwlGlyphAtlasState = createOwlGlyphAtlasState();
+
 let introRevealTimeline = null;
 let introRevealScrollTrigger = null;
 let introOwlDataPromise = null;
@@ -1950,7 +1988,6 @@ let workScrollSettleTimer = 0;
 let criticalSceneSyncPending = true;
 let syncCapabilityCardsFromScroll = null;
 let syncFooterFromScroll = null;
-let cameraLastRenderTime = Number.NEGATIVE_INFINITY;
 let cameraScrollTrigger = null;
 let cameraTemporalCanvas = null;
 let cameraTemporalCtx = null;
@@ -4140,9 +4177,252 @@ function getGlyphStyle(densityStats, normalizedY, opacityMultiplier = 1) {
 
   return {
     ink,
+    alpha,
+    tone,
     visible: alpha > 0.018,
     fill: `rgba(${r}, ${g}, ${b}, ${alpha})`,
   };
+}
+
+function ensureCameraGlyphAtlas() {
+  if (!IS_SAFARI_BROWSER || state.activeFont === "") return false;
+
+  const atlasKey = [
+    state.activeFont,
+    state.cellWidth,
+    state.cellHeight,
+    state.dpr,
+  ].join("|");
+  if (
+    cameraGlyphAtlasState.ready &&
+    cameraGlyphAtlasState.key === atlasKey &&
+    cameraGlyphAtlasState.canvas instanceof HTMLCanvasElement
+  ) {
+    return true;
+  }
+
+  cameraGlyphAtlasState.canvas ??= document.createElement("canvas");
+  cameraGlyphAtlasState.ctx ??=
+    cameraGlyphAtlasState.canvas.getContext("2d", { alpha: true });
+  if (cameraGlyphAtlasState.ctx === null) return false;
+
+  const tileWidth = Math.ceil(Math.max(
+    state.cellWidth + 4,
+    state.fontSize * 0.9 + 4,
+  ));
+  const tileHeight = Math.ceil(Math.max(
+    state.cellHeight + 4,
+    state.fontSize * 1.3 + 4,
+  ));
+  const sourceTileWidth = Math.max(1, Math.ceil(tileWidth * state.dpr));
+  const sourceTileHeight = Math.max(1, Math.ceil(tileHeight * state.dpr));
+  const spriteCount =
+    CAMERA_GLYPH_ATLAS_TONE_STEPS *
+    CAMERA_GLYPH_ATLAS_ALPHA_STEPS *
+    cameraGlyphAtlasState.characters.length;
+  const columns = Math.min(CAMERA_GLYPH_ATLAS_COLUMNS, spriteCount);
+  const rows = Math.ceil(spriteCount / columns);
+  const atlas = cameraGlyphAtlasState.canvas;
+  const atlasCtx = cameraGlyphAtlasState.ctx;
+
+  atlas.width = columns * sourceTileWidth;
+  atlas.height = rows * sourceTileHeight;
+  atlasCtx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
+  atlasCtx.clearRect(0, 0, atlas.width / state.dpr, atlas.height / state.dpr);
+  atlasCtx.font = state.activeFont;
+  atlasCtx.textAlign = "center";
+  atlasCtx.textBaseline = "middle";
+
+  for (
+    let toneIndex = 0;
+    toneIndex < CAMERA_GLYPH_ATLAS_TONE_STEPS;
+    toneIndex += 1
+  ) {
+    const tone = toneIndex / (CAMERA_GLYPH_ATLAS_TONE_STEPS - 1);
+    const red = mixChannel(BLUE_LIGHT.r, BLUE_DARK.r, tone);
+    const green = mixChannel(BLUE_LIGHT.g, BLUE_DARK.g, tone);
+    const blue = mixChannel(BLUE_LIGHT.b, BLUE_DARK.b, tone);
+
+    for (
+      let alphaIndex = 1;
+      alphaIndex < CAMERA_GLYPH_ATLAS_ALPHA_STEPS;
+      alphaIndex += 1
+    ) {
+      const alpha = alphaIndex / (CAMERA_GLYPH_ATLAS_ALPHA_STEPS - 1);
+      atlasCtx.fillStyle = `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+
+      cameraGlyphAtlasState.characters.forEach((character, characterIndex) => {
+        const spriteIndex = (
+          toneIndex * CAMERA_GLYPH_ATLAS_ALPHA_STEPS + alphaIndex
+        ) * cameraGlyphAtlasState.characters.length + characterIndex;
+        const column = spriteIndex % columns;
+        const row = Math.floor(spriteIndex / columns);
+
+        atlasCtx.fillText(
+          character,
+          column * tileWidth + tileWidth * 0.5,
+          row * tileHeight + tileHeight * 0.5,
+        );
+      });
+    }
+  }
+
+  cameraGlyphAtlasState.key = atlasKey;
+  cameraGlyphAtlasState.ready = true;
+  cameraGlyphAtlasState.tileWidth = tileWidth;
+  cameraGlyphAtlasState.tileHeight = tileHeight;
+  cameraGlyphAtlasState.sourceTileWidth = sourceTileWidth;
+  cameraGlyphAtlasState.sourceTileHeight = sourceTileHeight;
+  cameraGlyphAtlasState.columns = columns;
+  return true;
+}
+
+function ensureOwlGlyphAtlas(atlasState, renderState) {
+  if (!IS_SAFARI_BROWSER || renderState.activeFont === "") return false;
+
+  const atlasKey = [
+    renderState.activeFont,
+    renderState.cellWidth,
+    renderState.cellHeight,
+    renderState.dpr,
+  ].join("|");
+  if (
+    atlasState.ready &&
+    atlasState.key === atlasKey &&
+    atlasState.canvas instanceof HTMLCanvasElement
+  ) {
+    return true;
+  }
+
+  atlasState.canvas ??= document.createElement("canvas");
+  atlasState.ctx ??= atlasState.canvas.getContext("2d", { alpha: true });
+  if (atlasState.ctx === null) return false;
+
+  const tileWidth = Math.ceil(Math.max(
+    renderState.cellWidth + 4,
+    renderState.fontSize * 0.9 + 4,
+  ));
+  const tileHeight = Math.ceil(Math.max(
+    renderState.cellHeight + 4,
+    renderState.fontSize * 1.3 + 4,
+  ));
+  const sourceTileWidth = Math.max(1, Math.ceil(tileWidth * renderState.dpr));
+  const sourceTileHeight = Math.max(1, Math.ceil(tileHeight * renderState.dpr));
+  const spriteCount =
+    CAMERA_GLYPH_ATLAS_TONE_STEPS *
+    CAMERA_GLYPH_ATLAS_ALPHA_STEPS *
+    atlasState.characters.length;
+  const columns = Math.min(CAMERA_GLYPH_ATLAS_COLUMNS, spriteCount);
+  const rows = Math.ceil(spriteCount / columns);
+  const atlas = atlasState.canvas;
+  const atlasCtx = atlasState.ctx;
+
+  atlas.width = columns * sourceTileWidth;
+  atlas.height = rows * sourceTileHeight;
+  atlasCtx.setTransform(renderState.dpr, 0, 0, renderState.dpr, 0, 0);
+  atlasCtx.clearRect(
+    0,
+    0,
+    atlas.width / renderState.dpr,
+    atlas.height / renderState.dpr,
+  );
+  atlasCtx.font = renderState.activeFont;
+  atlasCtx.textAlign = "center";
+  atlasCtx.textBaseline = "middle";
+
+  for (
+    let toneIndex = 0;
+    toneIndex < CAMERA_GLYPH_ATLAS_TONE_STEPS;
+    toneIndex += 1
+  ) {
+    const tone = toneIndex / (CAMERA_GLYPH_ATLAS_TONE_STEPS - 1);
+    const color = tone < 0.58
+      ? mixIntroOwlColor(
+        INTRO_OWL_BLUE_LIGHT,
+        INTRO_OWL_BLUE_MID,
+        tone / 0.58,
+      )
+      : mixIntroOwlColor(
+        INTRO_OWL_BLUE_MID,
+        INTRO_OWL_BLUE_DARK,
+        (tone - 0.58) / 0.42,
+      );
+
+    for (
+      let alphaIndex = 1;
+      alphaIndex < CAMERA_GLYPH_ATLAS_ALPHA_STEPS;
+      alphaIndex += 1
+    ) {
+      const alpha = alphaIndex / (CAMERA_GLYPH_ATLAS_ALPHA_STEPS - 1);
+      atlasCtx.fillStyle =
+        `rgba(${color.r}, ${color.g}, ${color.b}, ${alpha})`;
+
+      atlasState.characters.forEach((character, characterIndex) => {
+        const spriteIndex = (
+          toneIndex * CAMERA_GLYPH_ATLAS_ALPHA_STEPS + alphaIndex
+        ) * atlasState.characters.length + characterIndex;
+        const column = spriteIndex % columns;
+        const row = Math.floor(spriteIndex / columns);
+
+        atlasCtx.fillText(
+          character,
+          column * tileWidth + tileWidth * 0.5,
+          row * tileHeight + tileHeight * 0.5,
+        );
+      });
+    }
+  }
+
+  atlasState.key = atlasKey;
+  atlasState.ready = true;
+  atlasState.tileWidth = tileWidth;
+  atlasState.tileHeight = tileHeight;
+  atlasState.sourceTileWidth = sourceTileWidth;
+  atlasState.sourceTileHeight = sourceTileHeight;
+  atlasState.columns = columns;
+  return true;
+}
+
+function drawOwlGlyphFromAtlas(
+  atlasState,
+  renderCtx,
+  glyphCell,
+  glyph,
+) {
+  if (
+    !atlasState.ready ||
+    !(atlasState.canvas instanceof HTMLCanvasElement)
+  ) {
+    return false;
+  }
+
+  const characterIndex = atlasState.characterIndexes.get(glyph) ?? 0;
+  const toneIndex = Math.round(
+    clamp(glyphCell.tone, 0, 1) * (CAMERA_GLYPH_ATLAS_TONE_STEPS - 1),
+  );
+  const alphaIndex = Math.max(1, Math.round(
+    clamp(glyphCell.alpha, 0, 1) * (CAMERA_GLYPH_ATLAS_ALPHA_STEPS - 1),
+  ));
+  const spriteIndex = (
+    toneIndex * CAMERA_GLYPH_ATLAS_ALPHA_STEPS + alphaIndex
+  ) * atlasState.characters.length + characterIndex;
+  const sourceX =
+    (spriteIndex % atlasState.columns) * atlasState.sourceTileWidth;
+  const sourceY =
+    Math.floor(spriteIndex / atlasState.columns) * atlasState.sourceTileHeight;
+
+  renderCtx.drawImage(
+    atlasState.canvas,
+    sourceX,
+    sourceY,
+    atlasState.sourceTileWidth,
+    atlasState.sourceTileHeight,
+    glyphCell.x - atlasState.tileWidth * 0.5,
+    glyphCell.y - atlasState.tileHeight * 0.5,
+    atlasState.tileWidth,
+    atlasState.tileHeight,
+  );
+  return true;
 }
 
 function getCameraCellAlpha(
@@ -4245,6 +4525,7 @@ function updateLayout() {
 
   state.fontSize = Math.max(6, fittedFontSize);
   state.activeFont = `${GLYPH_FONT_WEIGHT} ${state.fontSize}px ${state.fontFamily}`;
+  ensureCameraGlyphAtlas();
 }
 
 function updateIntroOwlLayout() {
@@ -4351,6 +4632,7 @@ function updateIntroOwlLayout() {
     introOwlState.temporalReady = false;
     introOwlState.layoutCacheKey = layoutCacheKey;
   }
+  ensureOwlGlyphAtlas(introOwlGlyphAtlasState, introOwlState);
 }
 
 function updateWorkFooterSceneLayout() {
@@ -6307,6 +6589,8 @@ function getIntroOwlCameraStyleCells(framePosition, cacheKey) {
         column,
         row,
         ink,
+        alpha,
+        tone: depth,
         fillStyle: `rgba(${color.r}, ${color.g}, ${color.b}, ${alpha})`,
         x: introOwlState.offsetX + (column + 0.5) * introOwlState.cellWidth,
         y: introOwlState.offsetY + (row + 0.5) * introOwlState.cellHeight,
@@ -6416,14 +6700,28 @@ function renderIntroOwl(framePosition = introOwlState.currentFramePosition) {
     clampedFramePosition,
     frameBucket,
   );
+  const useGlyphAtlas =
+    IS_SAFARI_BROWSER &&
+    ensureOwlGlyphAtlas(introOwlGlyphAtlasState, introOwlState);
 
   for (const glyphCell of glyphCells) {
-    renderCtx.fillStyle = glyphCell.fillStyle;
-    renderCtx.fillText(
-      getIntroOwlToneGlyph(glyphCell.column, glyphCell.row, glyphCell.ink),
-      glyphCell.x,
-      glyphCell.y,
+    const glyph = getIntroOwlToneGlyph(
+      glyphCell.column,
+      glyphCell.row,
+      glyphCell.ink,
     );
+    if (
+      !useGlyphAtlas ||
+      !drawOwlGlyphFromAtlas(
+        introOwlGlyphAtlasState,
+        renderCtx,
+        glyphCell,
+        glyph,
+      )
+    ) {
+      renderCtx.fillStyle = glyphCell.fillStyle;
+      renderCtx.fillText(glyph, glyphCell.x, glyphCell.y);
+    }
   }
 
   renderCtx.restore();
@@ -8611,13 +8909,19 @@ function getCameraGlyphCells(framePosition, cacheKey = null) {
         densityStats.edge = 0;
       }
 
-      const { ink, visible, fill } = getGlyphStyle(densityStats, normalizedY, maskAlpha);
+      const { ink, alpha, tone, visible, fill } = getGlyphStyle(
+        densityStats,
+        normalizedY,
+        maskAlpha,
+      );
       if (!visible) continue;
 
       glyphs.push({
         column,
         row,
         ink,
+        alpha,
+        tone,
         fill,
         x: state.offsetX + (column + 0.5) * state.cellWidth,
         y: state.offsetY + (row + 0.5) * state.cellHeight,
@@ -8639,9 +8943,48 @@ function getCameraGlyphCells(framePosition, cacheKey = null) {
 function drawCameraGlyphCell(cell, x = cell.x, y = cell.y, opacity = 1) {
   if (opacity <= 0) return;
 
+  const glyph = getGlyph(cell.column, cell.row, cell.ink);
+  if (
+    IS_SAFARI_BROWSER &&
+    cameraGlyphAtlasState.ready &&
+    cameraGlyphAtlasState.canvas instanceof HTMLCanvasElement
+  ) {
+    const characterIndex =
+      cameraGlyphAtlasState.characterIndexes.get(glyph) ?? 0;
+    const toneIndex = Math.round(
+      clamp(cell.tone, 0, 1) * (CAMERA_GLYPH_ATLAS_TONE_STEPS - 1),
+    );
+    const alphaIndex = Math.max(1, Math.round(
+      clamp(cell.alpha, 0, 1) * (CAMERA_GLYPH_ATLAS_ALPHA_STEPS - 1),
+    ));
+    const spriteIndex = (
+      toneIndex * CAMERA_GLYPH_ATLAS_ALPHA_STEPS + alphaIndex
+    ) * cameraGlyphAtlasState.characters.length + characterIndex;
+    const sourceX =
+      (spriteIndex % cameraGlyphAtlasState.columns) *
+      cameraGlyphAtlasState.sourceTileWidth;
+    const sourceY =
+      Math.floor(spriteIndex / cameraGlyphAtlasState.columns) *
+      cameraGlyphAtlasState.sourceTileHeight;
+
+    ctx.globalAlpha = clamp(opacity, 0, 1);
+    ctx.drawImage(
+      cameraGlyphAtlasState.canvas,
+      sourceX,
+      sourceY,
+      cameraGlyphAtlasState.sourceTileWidth,
+      cameraGlyphAtlasState.sourceTileHeight,
+      x - cameraGlyphAtlasState.tileWidth * 0.5,
+      y - cameraGlyphAtlasState.tileHeight * 0.5,
+      cameraGlyphAtlasState.tileWidth,
+      cameraGlyphAtlasState.tileHeight,
+    );
+    return;
+  }
+
   ctx.globalAlpha = clamp(opacity, 0, 1);
   ctx.fillStyle = cell.fill;
-  ctx.fillText(getGlyph(cell.column, cell.row, cell.ink), x, y);
+  ctx.fillText(glyph, x, y);
 }
 
 function ensureCameraTemporalCanvas() {
@@ -8784,15 +9127,10 @@ function renderFrame(framePosition) {
   ctx.clearRect(0, 0, state.canvasWidth, state.canvasHeight);
   ctx.fillStyle = CAMERA_CANVAS_BACKGROUND_COLOR;
   ctx.fillRect(0, 0, state.canvasWidth, state.canvasHeight);
-  const useTemporalBlend = !(IS_SAFARI_BROWSER && workScrollFast);
-  if (useTemporalBlend) {
-    drawTemporalCameraFrame();
-  } else {
-    // Two full-viewport canvas copies per scroll frame cost more than the
-    // subtle persistence effect on WebKit. Keep the scroll/compositor lane
-    // clear and resume temporal blending after velocity settles.
-    cameraTemporalReady = false;
-  }
+  // The preceding frame is part of the camera's authored softness. Keeping
+  // it active in Safari also masks source-frame boundaries without changing
+  // the actual motion, timing, glyph field, or colour treatment.
+  drawTemporalCameraFrame();
 
   ctx.save();
   ctx.font = state.activeFont;
@@ -8814,9 +9152,7 @@ function renderFrame(framePosition) {
   }
 
   renderWhiteHole();
-  if (useTemporalBlend) {
-    captureTemporalCameraFrame();
-  }
+  captureTemporalCameraFrame();
 }
 
 function renderCurrentProgress() {
@@ -9201,24 +9537,12 @@ function setupCameraRenderLoop() {
     const scrambleChanged =
       !workScrollFast &&
       Math.floor(time / SCRAMBLE_INTERVAL) !== state.currentScrambleBucket;
-    const safariTargetFps = workScrollFast
-      ? SAFARI_CAMERA_FAST_SCROLL_TARGET_FPS
-      : SAFARI_CAMERA_TARGET_FPS;
-    const safariFrameReady =
-      !IS_SAFARI_BROWSER ||
-      time - cameraLastRenderTime >= 1 / safariTargetFps;
-
     if (
       cameraPlaybackState.renderRequested ||
       progressChanged ||
       scrambleChanged
     ) {
-      if (safariFrameReady) {
-        cameraLastRenderTime = time;
-        renderCurrentProgress();
-      } else if (progressChanged) {
-        cameraPlaybackState.renderRequested = true;
-      }
+      renderCurrentProgress();
     }
 
     if (
@@ -9306,10 +9630,7 @@ function setupIntroOwlScramble() {
       introOwlState.loopStartTime = time;
     }
 
-    const targetFps = IS_SAFARI_BROWSER
-      ? SAFARI_INTRO_OWL_TARGET_FPS
-      : INTRO_OWL_TARGET_FPS;
-    const minimumFrameInterval = 1 / targetFps;
+    const minimumFrameInterval = 1 / INTRO_OWL_TARGET_FPS;
     if (time - introOwlState.lastRenderTime < minimumFrameInterval) return;
 
     const frameCount = getIntroOwlLoopFrameCount();
@@ -11712,6 +12033,7 @@ function updateWorkOwlCanvasSize() {
     workOwlRenderState.currentFrameBucket = -1;
     workOwlRenderState.layoutCacheKey = layoutCacheKey;
   }
+  ensureOwlGlyphAtlas(workOwlGlyphAtlasState, workOwlRenderState);
 }
 
 function ensureWorkOwlRenderLayers() {
@@ -11878,6 +12200,8 @@ function getWorkOwlCameraStyleCells(framePosition, cacheKey) {
         column,
         row,
         ink,
+        alpha,
+        tone: depth,
         fillStyle: `rgba(${color.r}, ${color.g}, ${color.b}, ${alpha})`,
         x: workOwlRenderState.offsetX +
           (column + 0.5) * workOwlRenderState.cellWidth,
@@ -11988,14 +12312,28 @@ function renderWorkOwlFrame(framePosition = workOwlRenderState.currentFramePosit
     clampedFramePosition,
     frameBucket,
   );
+  const useGlyphAtlas =
+    IS_SAFARI_BROWSER &&
+    ensureOwlGlyphAtlas(workOwlGlyphAtlasState, workOwlRenderState);
 
   for (const glyphCell of glyphCells) {
-    renderCtx.fillStyle = glyphCell.fillStyle;
-    renderCtx.fillText(
-      getWorkOwlToneGlyph(glyphCell.column, glyphCell.row, glyphCell.ink),
-      glyphCell.x,
-      glyphCell.y,
+    const glyph = getWorkOwlToneGlyph(
+      glyphCell.column,
+      glyphCell.row,
+      glyphCell.ink,
     );
+    if (
+      !useGlyphAtlas ||
+      !drawOwlGlyphFromAtlas(
+        workOwlGlyphAtlasState,
+        renderCtx,
+        glyphCell,
+        glyph,
+      )
+    ) {
+      renderCtx.fillStyle = glyphCell.fillStyle;
+      renderCtx.fillText(glyph, glyphCell.x, glyphCell.y);
+    }
   }
 
   renderCtx.restore();
@@ -12185,12 +12523,7 @@ function setupWorkOwlRenderLoop() {
 
     // Keep the last footer owl raster composited during a fast Safari scroll;
     // resume its internal frame animation as soon as scrolling settles.
-    const targetFps = IS_SAFARI_BROWSER
-      ? footerInteractionState === "playing"
-        ? SAFARI_WORK_OWL_ACTIVE_TARGET_FPS
-        : SAFARI_WORK_OWL_SETTLED_TARGET_FPS
-      : WORK_OWL_TARGET_FPS;
-    const minimumFrameInterval = 1 / targetFps;
+    const minimumFrameInterval = 1 / WORK_OWL_TARGET_FPS;
     if (time - workOwlLastRenderTime < minimumFrameInterval) return;
 
     const frameCount = getIntroOwlLoopFrameCount();
@@ -15857,7 +16190,47 @@ function waitForVisualWarmupOpportunity() {
   });
 }
 
+async function prewarmSafariCameraGlyphPipeline() {
+  if (
+    !IS_SAFARI_BROWSER ||
+    state.frameCount <= 0 ||
+    state.density === null
+  ) {
+    return;
+  }
+
+  // WebKit otherwise compiles the density/mask interpolation pipeline during
+  // the visitor's first wheel gesture. Exercise representative source frames
+  // while the startup cover still owns the screen, then discard the temporary
+  // arrays so the authored camera starts from a completely clean state.
+  ensureCameraGlyphAtlas();
+  const sampleCount = Math.min(16, Math.max(1, state.frameCount));
+
+  for (let index = 0; index < sampleCount; index += 1) {
+    const framePosition = sampleCount === 1
+      ? 0
+      : (index / (sampleCount - 1)) * (state.frameCount - 1);
+    const glyphCells = getCameraGlyphCells(framePosition);
+
+    // Include the deterministic glyph lookup in the warm path; drawImage is
+    // already exercised when the Safari atlas is prepared by updateLayout().
+    for (const glyphCell of glyphCells) {
+      getGlyph(glyphCell.column, glyphCell.row, glyphCell.ink);
+    }
+
+    if (index % 2 === 1 && index < sampleCount - 1) {
+      await waitForVisualWarmupOpportunity();
+    }
+  }
+
+  state.glyphCellCache.clear();
+  state.currentFrameBucket = -1;
+  state.currentProgressBucket = -1;
+  state.currentScrambleBucket = -1;
+}
+
 async function prewarmDeferredCanvasEffects() {
+  await prewarmSafariCameraGlyphPipeline();
   await waitForVisualWarmupOpportunity();
   capabilityGlyphBurstState.maxDpr = CAPABILITY_GLYPH_BURST_MAX_DPR;
   buildGlyphBurst(capabilityGlyphBurstState);
