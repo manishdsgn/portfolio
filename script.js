@@ -1140,12 +1140,12 @@ const FOOTER_WORD_EXPLOSION_DURATION = 0.54;
 const CELL_PADDING_RATIO = 0.07;
 const GLYPH_FONT_WEIGHT = 420;
 const FONT_SIZE_MULTIPLIER = 2.46;
-const CAMERA_MAX_DPR = IS_SAFARI_BROWSER ? 1 : 1.5;
+const CAMERA_MAX_DPR = 1.5;
 // WebKit's Canvas 2D text rasterization is substantially more expensive than
-// Chromium's at Retina scale. These canvases keep their CSS dimensions while
-// their compositor transforms continue at the display refresh rate.
-const INTRO_OWL_MAX_DPR = IS_SAFARI_BROWSER ? 1 : 2;
-const WORK_OWL_MAX_DPR = IS_SAFARI_BROWSER ? 1 : 2;
+// Chromium's at Retina scale. Safari's cached glyph atlas removes that text
+// cost, so these smaller owl canvases can retain native Retina sharpness.
+const INTRO_OWL_MAX_DPR = 2;
+const WORK_OWL_MAX_DPR = 2;
 const CAMERA_MASK_THRESHOLD = 220;
 const CAMERA_MASK_FEATHER = 26;
 // Preserve the authored sub-frame interpolation in every browser. Reducing
@@ -1926,6 +1926,7 @@ const cameraGlyphAtlasState = {
   tileHeight: 0,
   sourceTileWidth: 0,
   sourceTileHeight: 0,
+  dpr: 1,
   columns: 0,
   characters: Array.from(new Set(GLYPH_FAMILIES.join(""))),
   characterIndexes: new Map(),
@@ -1945,6 +1946,7 @@ function createOwlGlyphAtlasState() {
     tileHeight: 0,
     sourceTileWidth: 0,
     sourceTileHeight: 0,
+    dpr: 1,
     columns: 0,
     characters: cameraGlyphAtlasState.characters,
     characterIndexes: cameraGlyphAtlasState.characterIndexes,
@@ -4214,16 +4216,27 @@ function ensureCameraGlyphAtlas() {
     cameraGlyphAtlasState.canvas.getContext("2d", { alpha: true });
   if (cameraGlyphAtlasState.ctx === null) return false;
 
-  const tileWidth = Math.ceil(Math.max(
+  const requestedTileWidth = Math.ceil(Math.max(
     state.cellWidth + 4,
     state.fontSize * 0.9 + 4,
   ));
-  const tileHeight = Math.ceil(Math.max(
+  const requestedTileHeight = Math.ceil(Math.max(
     state.cellHeight + 4,
     state.fontSize * 1.3 + 4,
   ));
-  const sourceTileWidth = Math.max(1, Math.ceil(tileWidth * state.dpr));
-  const sourceTileHeight = Math.max(1, Math.ceil(tileHeight * state.dpr));
+  const sourceTileWidth = Math.max(
+    1,
+    Math.ceil(requestedTileWidth * state.dpr),
+  );
+  const sourceTileHeight = Math.max(
+    1,
+    Math.ceil(requestedTileHeight * state.dpr),
+  );
+  // Make every logical atlas tile resolve to an exact device-pixel rectangle.
+  // At fractional DPR, multiplying an integer CSS tile by 1.5 produced
+  // half-pixel sprite boundaries and WebKit bilinearly softened each glyph.
+  const tileWidth = sourceTileWidth / state.dpr;
+  const tileHeight = sourceTileHeight / state.dpr;
   const spriteCount =
     CAMERA_GLYPH_ATLAS_TONE_STEPS *
     CAMERA_GLYPH_ATLAS_ALPHA_STEPS *
@@ -4281,6 +4294,7 @@ function ensureCameraGlyphAtlas() {
   cameraGlyphAtlasState.tileHeight = tileHeight;
   cameraGlyphAtlasState.sourceTileWidth = sourceTileWidth;
   cameraGlyphAtlasState.sourceTileHeight = sourceTileHeight;
+  cameraGlyphAtlasState.dpr = state.dpr;
   cameraGlyphAtlasState.columns = columns;
   return true;
 }
@@ -4306,16 +4320,24 @@ function ensureOwlGlyphAtlas(atlasState, renderState) {
   atlasState.ctx ??= atlasState.canvas.getContext("2d", { alpha: true });
   if (atlasState.ctx === null) return false;
 
-  const tileWidth = Math.ceil(Math.max(
+  const requestedTileWidth = Math.ceil(Math.max(
     renderState.cellWidth + 4,
     renderState.fontSize * 0.9 + 4,
   ));
-  const tileHeight = Math.ceil(Math.max(
+  const requestedTileHeight = Math.ceil(Math.max(
     renderState.cellHeight + 4,
     renderState.fontSize * 1.3 + 4,
   ));
-  const sourceTileWidth = Math.max(1, Math.ceil(tileWidth * renderState.dpr));
-  const sourceTileHeight = Math.max(1, Math.ceil(tileHeight * renderState.dpr));
+  const sourceTileWidth = Math.max(
+    1,
+    Math.ceil(requestedTileWidth * renderState.dpr),
+  );
+  const sourceTileHeight = Math.max(
+    1,
+    Math.ceil(requestedTileHeight * renderState.dpr),
+  );
+  const tileWidth = sourceTileWidth / renderState.dpr;
+  const tileHeight = sourceTileHeight / renderState.dpr;
   const spriteCount =
     CAMERA_GLYPH_ATLAS_TONE_STEPS *
     CAMERA_GLYPH_ATLAS_ALPHA_STEPS *
@@ -4387,6 +4409,7 @@ function ensureOwlGlyphAtlas(atlasState, renderState) {
   atlasState.tileHeight = tileHeight;
   atlasState.sourceTileWidth = sourceTileWidth;
   atlasState.sourceTileHeight = sourceTileHeight;
+  atlasState.dpr = renderState.dpr;
   atlasState.columns = columns;
   return true;
 }
@@ -4418,6 +4441,12 @@ function drawOwlGlyphFromAtlas(
     (spriteIndex % atlasState.columns) * atlasState.sourceTileWidth;
   const sourceY =
     Math.floor(spriteIndex / atlasState.columns) * atlasState.sourceTileHeight;
+  const destinationX = Math.round(
+    (glyphCell.x - atlasState.tileWidth * 0.5) * atlasState.dpr,
+  ) / atlasState.dpr;
+  const destinationY = Math.round(
+    (glyphCell.y - atlasState.tileHeight * 0.5) * atlasState.dpr,
+  ) / atlasState.dpr;
 
   renderCtx.drawImage(
     atlasState.canvas,
@@ -4425,8 +4454,8 @@ function drawOwlGlyphFromAtlas(
     sourceY,
     atlasState.sourceTileWidth,
     atlasState.sourceTileHeight,
-    glyphCell.x - atlasState.tileWidth * 0.5,
-    glyphCell.y - atlasState.tileHeight * 0.5,
+    destinationX,
+    destinationY,
     atlasState.tileWidth,
     atlasState.tileHeight,
   );
@@ -6711,6 +6740,9 @@ function renderIntroOwl(framePosition = introOwlState.currentFramePosition) {
   const useGlyphAtlas =
     IS_SAFARI_BROWSER &&
     ensureOwlGlyphAtlas(introOwlGlyphAtlasState, introOwlState);
+  if (useGlyphAtlas) {
+    renderCtx.imageSmoothingEnabled = false;
+  }
 
   for (const glyphCell of glyphCells) {
     const glyph = getIntroOwlToneGlyph(
@@ -8974,6 +9006,12 @@ function drawCameraGlyphCell(cell, x = cell.x, y = cell.y, opacity = 1) {
     const sourceY =
       Math.floor(spriteIndex / cameraGlyphAtlasState.columns) *
       cameraGlyphAtlasState.sourceTileHeight;
+    const destinationX = Math.round(
+      (x - cameraGlyphAtlasState.tileWidth * 0.5) * state.dpr,
+    ) / state.dpr;
+    const destinationY = Math.round(
+      (y - cameraGlyphAtlasState.tileHeight * 0.5) * state.dpr,
+    ) / state.dpr;
 
     ctx.globalAlpha = clamp(opacity, 0, 1);
     ctx.drawImage(
@@ -8982,8 +9020,8 @@ function drawCameraGlyphCell(cell, x = cell.x, y = cell.y, opacity = 1) {
       sourceY,
       cameraGlyphAtlasState.sourceTileWidth,
       cameraGlyphAtlasState.sourceTileHeight,
-      x - cameraGlyphAtlasState.tileWidth * 0.5,
-      y - cameraGlyphAtlasState.tileHeight * 0.5,
+      destinationX,
+      destinationY,
       cameraGlyphAtlasState.tileWidth,
       cameraGlyphAtlasState.tileHeight,
     );
@@ -9144,6 +9182,9 @@ function renderFrame(framePosition) {
   ctx.font = state.activeFont;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
+  if (IS_SAFARI_BROWSER && cameraGlyphAtlasState.ready) {
+    ctx.imageSmoothingEnabled = false;
+  }
 
   for (const cell of glyphs) {
     drawCameraGlyphCell(cell);
@@ -12323,6 +12364,9 @@ function renderWorkOwlFrame(framePosition = workOwlRenderState.currentFramePosit
   const useGlyphAtlas =
     IS_SAFARI_BROWSER &&
     ensureOwlGlyphAtlas(workOwlGlyphAtlasState, workOwlRenderState);
+  if (useGlyphAtlas) {
+    renderCtx.imageSmoothingEnabled = false;
+  }
 
   for (const glyphCell of glyphCells) {
     const glyph = getWorkOwlToneGlyph(
