@@ -62,6 +62,25 @@ const playFooterOrganGlyphSound = defineSound(
 );
 const playMinimalPopSound = defineSound(minimalPop);
 const playMinimalTapSound = defineSound(minimalTap);
+const GALLERY_POP_MAX_BURST = 12;
+const GALLERY_POP_STEP_DELAY = 0.055;
+const GALLERY_POP_VOLUME = 1;
+// A fast scroll can cross several gallery images in one rendered frame. Build
+// fixed Web Audio bursts up front so every crossed image receives its authored
+// pop, scheduled on the audio clock rather than dropped by a JS-time throttle.
+const playGalleryPopBurstSounds = Object.freeze(
+  Array.from({ length: GALLERY_POP_MAX_BURST }, (_, burstIndex) => {
+    const cueCount = burstIndex + 1;
+    return defineSound(Object.freeze({
+      layers: Object.freeze(
+        Array.from({ length: cueCount }, (_, cueIndex) => Object.freeze({
+          ...minimalPop,
+          delay: cueIndex * GALLERY_POP_STEP_DELAY,
+        })),
+      ),
+    }));
+  }),
+);
 // Keep the high-frequency micro-cues dry and deterministic. Per-voice effect
 // chains made overlapping Safari voices pump at different levels, while the
 // project-wide limiter already provides peak control.
@@ -85,34 +104,35 @@ const INTRO_HIGHLIGHT_SWOOSH_SCALE = Object.freeze([
   1200,
   1400,
 ]);
-const INTRO_HIGHLIGHT_SWOOSH_VOLUME = 0.28;
-const INTRO_HIGHLIGHT_SWOOSH_MIN_INTERVAL_MS = 88;
-const INTRO_HIGHLIGHT_SWOOSH_MAX_VOICES = 2;
+const INTRO_HIGHLIGHT_SWOOSH_VOLUME = 0.42;
+const INTRO_HIGHLIGHT_SWOOSH_MIN_INTERVAL_MS = 56;
+const INTRO_HIGHLIGHT_SWOOSH_MAX_VOICES = 4;
 const INTRO_HIGHLIGHT_SWOOSH_VOICE_LIFETIME_MS = 620;
 const INTRO_HIGHLIGHT_SWOOSH_RELEASE = 0.04;
-const INTRO_KEY_PRESS_VOLUME = 0.32;
-const INTRO_KEY_PRESS_OVERLAP_VOLUME_SCALE = 0.5;
+const INTRO_KEY_PRESS_VOLUME = 0.48;
+const INTRO_KEY_PRESS_OVERLAP_VOLUME_SCALE = 0.7;
 const INTRO_KEY_PRESS_MAX_VOICES = 2;
 const INTRO_KEY_PRESS_VOICE_LIFETIME_MS = 120;
 const INTRO_KEY_PRESS_RELEASE = 0.018;
 const GLYPH_SPLASH_VOLUME = 0.35;
 const FOOTER_ORGAN_GLYPH_VOLUME = 0.9;
-const DOT_GLITCH_NOTIFICATION_VOLUME = 0.2;
+const DOT_GLITCH_NOTIFICATION_VOLUME = 0.36;
 const CAPABILITY_HIGHLIGHT_INITIAL_TAP_VOLUME = 0.62;
 const CAPABILITY_HIGHLIGHT_TAP_CARD_OFFSET = 0.045;
 const PAGE_TRANSITION_NOISE_VOLUME = 0.16;
 const PAGE_TRANSITION_NOISE_FADE_OUT_DURATION = 0.48;
-const PROJECT_AUDIO_MASTER_VOLUME = 0.5;
+// Retain a small amount of headroom while keeping the perceived level close
+// to the original unity-gain local build.
+const PROJECT_AUDIO_MASTER_VOLUME = 0.96;
 const PROJECT_AUDIO_UNLOCK_TIMEOUT_MS = 1400;
-const GALLERY_POP_MIN_INTERVAL_MS = 110;
 const CAPABILITY_TAP_MIN_INTERVAL_MS = 90;
 const INTRO_KEY_PRESS_MIN_INTERVAL_MS = 28;
-const INTRO_KEY_PRESS_DETUNE_PATTERN = Object.freeze([0]);
+const INTRO_KEY_PRESS_DETUNE_PATTERN = Object.freeze([-45, 0, 35, 0]);
 const CAMERA_AMBIENT_SOUND_PATH = "/audio/hero-ambient-swell.mp3";
-const CAMERA_AMBIENT_RISE_VOLUME = 0.09;
-const CAMERA_AMBIENT_PEAK_VOLUME = 0.2;
+const CAMERA_AMBIENT_RISE_VOLUME = 0.14;
+const CAMERA_AMBIENT_PEAK_VOLUME = 0.34;
 const FOOTER_AMBIENT_START_TIME = 0.55;
-const FOOTER_AMBIENT_VOLUME = 0.18;
+const FOOTER_AMBIENT_VOLUME = 0.3;
 const FOOTER_AMBIENT_DURATION = 2.28;
 const FOOTER_AMBIENT_FADE_OUT_DURATION = 0.86;
 const AMBIENT_RELEASE_DURATION = 0.035;
@@ -152,7 +172,6 @@ let introHighlightSwooshPlayedWords = new WeakSet();
 const introHighlightSwooshQueue = [];
 const introHighlightSwooshVoices = [];
 let pageTransitionNoiseVoice = null;
-let galleryPopLastPlayedAt = Number.NEGATIVE_INFINITY;
 let capabilityTapLastPlayedAt = Number.NEGATIVE_INFINITY;
 
 function configureProjectAudioGraph() {
@@ -168,12 +187,16 @@ function configureProjectAudioGraph() {
     projectAudioContext = context;
     projectAudioLimiter = context.createDynamicsCompressor();
     projectAudioCeiling = context.createGain();
-    projectAudioLimiter.threshold.value = -16;
-    projectAudioLimiter.knee.value = 6;
-    projectAudioLimiter.ratio.value = 14;
-    projectAudioLimiter.attack.value = 0.001;
-    projectAudioLimiter.release.value = 0.14;
-    projectAudioCeiling.gain.value = 0.82;
+    // The previous -16 dB / 140 ms limiter held the whole mix down after an
+    // overlapping cue. Safari then rendered the next dot as faint while an
+    // isolated dot sounded loud. This stage now catches only true near-clips;
+    // normal transients keep their original attack and relative level.
+    projectAudioLimiter.threshold.value = -4;
+    projectAudioLimiter.knee.value = 2;
+    projectAudioLimiter.ratio.value = 10;
+    projectAudioLimiter.attack.value = 0.002;
+    projectAudioLimiter.release.value = 0.045;
+    projectAudioCeiling.gain.value = 0.98;
 
     try {
       masterBus.disconnect();
@@ -447,14 +470,16 @@ function playFooterOrganGlyphSplash() {
   playFooterOrganGlyphSound({ volume: FOOTER_ORGAN_GLYPH_VOLUME });
 }
 
-function playGalleryPop() {
+function playGalleryPop(cueCount = 1) {
   if (!isProjectAudioRunning()) return;
 
-  const now = performance.now();
-  if (now - galleryPopLastPlayedAt < GALLERY_POP_MIN_INTERVAL_MS) return;
-  galleryPopLastPlayedAt = now;
-
-  playMinimalPopSound({ volume: 0.72 });
+  const normalizedCueCount = Math.max(
+    1,
+    Math.min(GALLERY_POP_MAX_BURST, Math.round(cueCount)),
+  );
+  playGalleryPopBurstSounds[normalizedCueCount - 1]({
+    volume: GALLERY_POP_VOLUME,
+  });
 }
 
 function playCapabilityHighlightTap(volume = CAPABILITY_HIGHLIGHT_INITIAL_TAP_VOLUME) {
@@ -13302,13 +13327,17 @@ function renderWorkWaveCaption() {
   workWaveCaption.classList.toggle("is-visible", closestIndex >= 0);
   if (closestIndex < 0 || closestIndex === workWaveActiveIndex) return;
 
+  const previousIndex = workWaveActiveIndex;
   workWaveActiveIndex = closestIndex;
   const direction = workWaveCaptionDirection >= 0 ? "up" : "down";
   const timing = getWorkWaveCaptionTiming(closestIndex);
   const sourceIndex = getWorkWaveSourceIndex(closestIndex);
   const name = WORK_WAVE_NAMES[sourceIndex] ?? "image";
+  const crossedImageCount = previousIndex < 0
+    ? 1
+    : Math.max(1, Math.abs(closestIndex - previousIndex));
 
-  playGalleryPop();
+  playGalleryPop(crossedImageCount);
 
   workWaveNameSlot?.set(name, {
     direction,
