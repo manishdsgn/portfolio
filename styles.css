@@ -90,6 +90,13 @@ html {
   overscroll-behavior: none;
 }
 
+/* Windows uses classic, layout-consuming scrollbars by default. Reserve that
+   gutter through every authored scroll lock so fixed, sticky, and centered
+   scenes keep identical geometry when scrolling is paused and resumed. */
+html.is-windows {
+  scrollbar-gutter: stable;
+}
+
 body {
   margin: 0;
   min-height: 100vh;
@@ -1534,6 +1541,43 @@ body.capability-cards-active .capability-card__keyword::before {
 
 .capability-card__blue-copy .capability-card__keyword::before {
   display: none;
+}
+
+/* The cards top out at 300px, so their internal viewport-relative tokens must
+   stop growing at the same point. Freeze wide Windows layouts to the authored
+   1366px desktop proportions; this keeps the Code card's longest row inside
+   its content grid without changing any transform or timeline. */
+@media (min-width: 1367px) {
+  html.is-windows .capability-cards__deck {
+    width: min(1038.16px, calc(100% - 48px));
+    gap: 43.712px;
+  }
+
+  html.is-windows .capability-card {
+    --capability-card-radius: 11.611px;
+    --capability-card-padding: 10.928px;
+    --capability-card-section-gap: 12.294px;
+    flex: 0 0 300px;
+    width: 300px;
+    max-width: 300px;
+  }
+
+  html.is-windows .capability-card__content {
+    padding: 18.441px 19.807px 21.173px;
+  }
+
+  html.is-windows .capability-card__keyword-field,
+  html.is-windows .capability-card__blue-copy {
+    gap: 9.835px 11.201px;
+  }
+
+  html.is-windows .capability-card__keyword {
+    font-size: 16.119px;
+  }
+
+  html.is-windows .capability-card__blue-runner {
+    height: 23.222px;
+  }
 }
 
 .capability-owl-peek {

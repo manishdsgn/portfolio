@@ -68,6 +68,18 @@
       crossorigin="anonymous"
       fetchpriority="low"
     />
+    <script>
+      // Apply Windows-only layout safeguards before the first stylesheet
+      // paint so classic scrollbars cannot change the page geometry.
+      (() => {
+        const platform =
+          navigator.userAgentData?.platform || navigator.platform || "";
+
+        if (/^win/i.test(platform)) {
+          document.documentElement.classList.add("is-windows");
+        }
+      })();
+    </script>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body class="is-startup-loading" data-current-page="work">
@@ -857,7 +869,7 @@
 
           <nav class="site-footer__socials" data-footer-socials aria-label="Social links">
             <a href="https://www.linkedin.com/in/manishkr369" target="_blank" rel="noopener noreferrer" data-footer-social aria-label="LinkedIn">LinkedIn</a>
-            <a href="#" data-footer-social aria-label="X">X</a>
+            <a href="https://x.com/manishdsgn" target="_blank" rel="noopener noreferrer" data-footer-social aria-label="X">X</a>
             <a href="https://github.com/manishdsgn" target="_blank" rel="noopener noreferrer" data-footer-social aria-label="GitHub">GitHub</a>
             <a href="https://instagram.com/nolouderthanlight" target="_blank" rel="noopener noreferrer" data-footer-social aria-label="Instagram">Instagram</a>
             <a href="https://vsco.co/-manishh" target="_blank" rel="noopener noreferrer" data-footer-social aria-label="VSCO">VSCO</a>
